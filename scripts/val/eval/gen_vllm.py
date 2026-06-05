@@ -35,17 +35,20 @@ def extract_max_number(path):
         return max(int(n) for n in numbers)
     return -1  # If there is no number, keep this entry at the end.
 
-# Collect model paths and sort them by descending numeric suffix.
-try:
-    model_files = os.listdir(MODEL_FOLDER)
-    MODEL_NAMES_CANDIDATES = [os.path.join(MODEL_FOLDER, f) for f in model_files]
-    MODEL_NAMES_CANDIDATES.sort(key=extract_max_number, reverse=True)
-except FileNotFoundError:
+# Optional legacy folder scan. Prefer passing --model for explicit evaluation.
+MODEL_FOLDER = os.environ.get("MODEL_FOLDER")
+if MODEL_FOLDER:
+    try:
+        model_files = os.listdir(MODEL_FOLDER)
+        MODEL_NAMES_CANDIDATES = [os.path.join(MODEL_FOLDER, f) for f in model_files]
+        MODEL_NAMES_CANDIDATES.sort(key=extract_max_number, reverse=True)
+    except FileNotFoundError:
+        MODEL_NAMES_CANDIDATES = []
+else:
     MODEL_NAMES_CANDIDATES = []
 
 # Active model list.
-MODEL_NAMES = MODEL_NAMES_CANDIDATES
-MODEL_NAMES = ["../../model/Qwen3-4B"]
+MODEL_NAMES = MODEL_NAMES_CANDIDATES or ["../../model/Qwen3-4B"]
 
 TASKS = [
     {"name": "AIME24", "path": f"{DATA_DIR}/AIME24/test.parquet", "N": 16},
@@ -215,7 +218,21 @@ def worker_process(args_tuple):
 # --------------------------------------------------------------------------- #
 #                                   main                                      #
 # --------------------------------------------------------------------------- #
+def parse_tasks(task_specs, default_n):
+    tasks = []
+    for spec in task_specs:
+        parts = spec.split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError(f"Bad task spec: {spec}. Expected NAME:PATH[:N].")
+        name, task_path = parts[0], parts[1]
+        n = int(parts[2]) if len(parts) == 3 else default_n
+        tasks.append({"name": name, "path": task_path, "N": n})
+    return tasks
+
+
 def main():
+    global MAX_TOKENS, TEMPERATURE, TOP_P, REPLACE
+
     parser = argparse.ArgumentParser(description="Generate evaluation rollouts with vLLM.")
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
@@ -230,24 +247,40 @@ def main():
         action="store_false",
         help="Disable thinking when applying the chat template.",
     )
+    parser.add_argument("--model", action="append", dest="models", help="HF model path. Can be passed multiple times.")
+    parser.add_argument("--task", action="append", dest="tasks", help="Task spec NAME:PARQUET[:N]. Can be passed multiple times.")
+    parser.add_argument("--out-dir", default="justrl_eval_outputs", help="Directory for generated jsonl files.")
+    parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids, one vLLM worker per GPU.")
+    parser.add_argument("--n", type=int, default=16, help="Default number of rollouts per problem.")
+    parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE)
+    parser.add_argument("--top-p", type=float, default=TOP_P)
+    parser.add_argument("--replace", action="store_true", help="Overwrite existing generation files.")
     parser.set_defaults(enable_thinking=False)
     args = parser.parse_args()
 
-    # Specify GPU IDs, with one model instance assigned to each GPU.
-    available_gpus = [0, 1, 2, 3, 4, 5, 6, 7]
-    gpu_workers = [str(gpu_id) for gpu_id in available_gpus]
+    model_names = args.models or MODEL_NAMES
+    tasks = parse_tasks(args.tasks, args.n) if args.tasks else TASKS
+    gpu_workers = [gpu.strip() for gpu in args.gpus.split(",") if gpu.strip()]
+    if not gpu_workers:
+        raise ValueError("--gpus must contain at least one GPU id.")
+
+    MAX_TOKENS = args.max_tokens
+    TEMPERATURE = args.temperature
+    TOP_P = args.top_p
+    REPLACE = args.replace
     num_workers = len(gpu_workers)
 
     print(f"GPU workers (one model per GPU): {gpu_workers}")
     print(f"apply_chat_template enable_thinking={args.enable_thinking}")
 
-    for model_name in MODEL_NAMES:
+    for model_name in model_names:
         print(f"\n{'='*50}\nStarting evaluation for model: {model_name}\n{'='*50}")
         
-        OUT_DIR = Path(f"justrl_eval_outputs/{model_name.split('/')[-1]}")
+        OUT_DIR = Path(args.out_dir) / model_name.rstrip("/").split("/")[-1]
         OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        for task in TASKS:
+        for task in tasks:
             task_name = task["name"]
             task_path = task["path"]
             N = task["N"]

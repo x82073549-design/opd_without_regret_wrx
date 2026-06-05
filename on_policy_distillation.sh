@@ -28,7 +28,9 @@ if [ -z "$SLURM_JOB_ID" ]; then
     echo "=========================================="
 fi
 
-ray stop --force
+if [ "${SKIP_RAY_STOP:-False}" != "True" ]; then
+    ray stop --force || true
+fi
 export RAY_memory_usage_threshold=0.99
 export CUDA_LAUNCH_BLOCKING=1
 # export CUDA_VISIBLE_DEVICES=1,2,3,4
@@ -61,12 +63,40 @@ export N_RESPONSES=4 # TODO: 4 / 8 / 16 / 32 (default: 8)
 export LOG_PROB_TOP_K=${LOG_PROB_TOP_K:-16} # 0 represents no top-k sampling
 export TOP_K_STRATEGY=${TOP_K_STRATEGY:-"only_stu"} # "only_stu" or "only_tch" or "intersection" or "union" or "union-intersection"
 export REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-"student_p"} # "student_p" or "teacher_p" or "none"
+export PREFIX_CORRECTION_ENABLE=${PREFIX_CORRECTION_ENABLE:-False}
+export PRM_MODEL_PATH=${PRM_MODEL_PATH:-model/Skywork-o1-Open-PRM-Qwen-2.5-1.5B}
+export PREFIX_CORRECTION_SEGMENTATION=${PREFIX_CORRECTION_SEGMENTATION:-delimiter_grouped}
+export N_PRM_BLOCKS=${N_PRM_BLOCKS:-64}
+export INCLUDE_SAMPLED_TOKEN=${INCLUDE_SAMPLED_TOKEN:-False}
+export USE_PRM_GATE=${USE_PRM_GATE:-True}
+export USE_VALUE_DELTA=${USE_VALUE_DELTA:-True}
+export PREFIX_GATE_MODE=${PREFIX_GATE_MODE:-running_zscore}
+export PREFIX_EMA_LAMBDA=${PREFIX_EMA_LAMBDA:-0.6}
+export PREFIX_GATE_ALPHA=${PREFIX_GATE_ALPHA:-0.25}
+export PREFIX_MIN_GATE=${PREFIX_MIN_GATE:-0.5}
+export PREFIX_MAX_GATE=${PREFIX_MAX_GATE:-1.5}
+export PREFIX_RUNNING_STATS_MOMENTUM=${PREFIX_RUNNING_STATS_MOMENTUM:-0.95}
+export PREFIX_STD_FLOOR=${PREFIX_STD_FLOOR:-0.05}
+export VALUE_DELTA_COEF=${VALUE_DELTA_COEF:-0.1}
+export PREFIX_DELTA_CLIP=${PREFIX_DELTA_CLIP:-0.5}
+export PREFIX_DELTA_CLIP_Z=${PREFIX_DELTA_CLIP_Z:-2.0}
+export PRM_MICRO_BATCH_SIZE=${PRM_MICRO_BATCH_SIZE:-1}
+export PRM_DTYPE=${PRM_DTYPE:-bf16}
+export OUTCOME_OPD_MASK_ENABLE=${OUTCOME_OPD_MASK_ENABLE:-False}
+export OUTCOME_OPD_CORRECT_THRESHOLD=${OUTCOME_OPD_CORRECT_THRESHOLD:-0.5}
+export OUTCOME_OPD_WRONG_PREFIX_RATIO=${OUTCOME_OPD_WRONG_PREFIX_RATIO:-0.25}
+export OUTCOME_OPD_MIN_PREFIX_TOKENS=${OUTCOME_OPD_MIN_PREFIX_TOKENS:-1}
+export RATIO_KL_SWITCH_ENABLE=${RATIO_KL_SWITCH_ENABLE:-False}
+export RATIO_KL_SWITCH_SAMPLE_DISTRIBUTION=${RATIO_KL_SWITCH_SAMPLE_DISTRIBUTION:-bernoulli}
+export RATIO_KL_SWITCH_TOP_K=${RATIO_KL_SWITCH_TOP_K:-16}
+export RATIO_KL_SWITCH_CANDIDATE_SOURCE=${RATIO_KL_SWITCH_CANDIDATE_SOURCE:-student_topk}
+export RATIO_KL_SWITCH_LOG_RATIO_CLIP_MIN=${RATIO_KL_SWITCH_LOG_RATIO_CLIP_MIN:--80.0}
 # export LR=${LR:-1e-6}
 # export LR_SCHEDULER=${LR_SCHEDULER:-constant}
 export USE_KL=${USE_KL:-False} # TODO: True / False (default False)
 export ENABLE_FORMAT_REWARD=${ENABLE_FORMAT_REWARD:-False} # TODO: True / False (default False)
 export MODEL_DTYPE=${MODEL_DTYPE:-fp32} # actor/ref/critic fsdp_config.model_dtype: fp32 or bfloat16
-export IS_PLOT=${IS_PLOT:-True} # TODO: True / False (default False)
+export IS_PLOT=${IS_PLOT:-False} # TODO: True / False (default False)
 export LOSS_AGG_MODE=${LOSS_AGG_MODE:-"token-mean"} # TODO: "token-mean" / "seq-mean-token-sum" / "seq-mean-token-mean" / "seq-mean-token-sum-norm" (default "token-mean")
 
 # TODO: qwen3_1p7b_base / qwen3_1p7b / llama31_8b_base / llama31_8b_inst / qwen3_8b_base / qwen3_8b / qwen25_1p5b_base / qwen25_1p5b_inst / qwen25_7b_base / qwen25_7b_inst / qwen25_math_7b_base / qwen25_math_7b_inst / qwen25_math_1p5b_base / qwen25_math_1p5b_inst / distill_r1_1p5b / olmo2_1124_7b_base / olmo2_1124_7b_sft / olmo2_1124_7b_inst / llama32_3b_inst
@@ -76,14 +106,14 @@ export LOSS_AGG_MODE=${LOSS_AGG_MODE:-"token-mean"} # TODO: "token-mean" / "seq-
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/OpenThoughts3_opd.parquet
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/sampled_complement_30k.parquet
 # export TRAIN_DATASET=datasets/DeepMath-103K/verl_format/train_filtered_sampled.parquet
-export TRAIN_DATASET=datasets/dapo-math-17k.parquet
+export TRAIN_DATASET=${TRAIN_DATASET:-datasets/dapo-math-17k_2k.parquet}
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/data/math-00000-of-00001.parquet
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/filtered/math-1p5b-filtered-diff-max8.parquet
 # export TRAIN_DATASET=datasets/DAPO-Math-17k-Processed/DAPO-Math.parquet
 # export TRAIN_DATASET=datasets/skywork/train_7b_math.parquet
 # export TRAIN_DATASET=datasets/DAPO-Math-17k-Processed/DAPO-Math_part2.parquet
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/verl_format/train.parquet
-export TRAIN_DATASET_NAME=DAPO-Math-17k
+export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-2k}
 # export TRAIN_DATASET_NAME=POLARIS-4B-S1
 # export TRAIN_DATASET_NAME=Skywork-OR1-RL-Data
 # export TRAIN_DATASET_NAME=DAPO-Math-17k-1percent
@@ -132,8 +162,21 @@ export REWARD_MODEL_NAME=$(basename "$REWARD_MODEL_PATH")
 
 export PROJECT_PATH=checkpoint
 export PARALLEL_SIZE=1
-export CKPT_PATH=${PROJECT_PATH}/${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-$(date +%Y-%m-%d_%H-%M-%S)
-export OUTLINES_CACHE_DIR=~/.cache/outlines/$(uuidgen)
+PREFIX_CORRECTION_SUFFIX=""
+if [ "$PREFIX_CORRECTION_ENABLE" = "True" ]; then
+    PREFIX_CORRECTION_SUFFIX="-rgopd_v2_prm_${N_PRM_BLOCKS}-sampled_${INCLUDE_SAMPLED_TOKEN}-gate_${USE_PRM_GATE}-${PREFIX_GATE_MODE}-delta_${USE_VALUE_DELTA}"
+fi
+OUTCOME_OPD_MASK_SUFFIX=""
+if [ "$OUTCOME_OPD_MASK_ENABLE" = "True" ]; then
+    OUTCOME_OPD_MASK_SUFFIX="-outcome_opd_wrong${OUTCOME_OPD_WRONG_PREFIX_RATIO}"
+fi
+RATIO_KL_SWITCH_SUFFIX=""
+if [ "$RATIO_KL_SWITCH_ENABLE" = "True" ]; then
+    RATIO_KL_SWITCH_SUFFIX="-tropd_sampled_gate_topk_rkl_fkl"
+fi
+export CKPT_PATH=${PROJECT_PATH}/${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${PREFIX_CORRECTION_SUFFIX}${OUTCOME_OPD_MASK_SUFFIX}${RATIO_KL_SWITCH_SUFFIX}-$(date +%Y-%m-%d_%H-%M-%S)
+OUTLINES_UUID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
+export OUTLINES_CACHE_DIR=~/.cache/outlines/${OUTLINES_UUID}
 export NCCL_DEBUG=WARN
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
@@ -143,7 +186,48 @@ export SWANLAB_LOG_DIR=${PROJECT_PATH}/swanlab_log
 export HYDRA_FULL_ERROR=1
 
 
-export EXPERIMENT_NAME=${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-$(date +%Y-%m-%d_%H-%M-%S)
+export EXPERIMENT_NAME=${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${PREFIX_CORRECTION_SUFFIX}${OUTCOME_OPD_MASK_SUFFIX}${RATIO_KL_SWITCH_SUFFIX}-$(date +%Y-%m-%d_%H-%M-%S)
+
+PREFIX_CORRECTION_ARGS=""
+if [ "$PREFIX_CORRECTION_ENABLE" = "True" ]; then
+    PREFIX_CORRECTION_ARGS="+algorithm.prefix_correction.enable=True \
+    +algorithm.prefix_correction.prm_model_path=$PRM_MODEL_PATH \
+    +algorithm.prefix_correction.segmentation=$PREFIX_CORRECTION_SEGMENTATION \
+    +algorithm.prefix_correction.n_prm_blocks=$N_PRM_BLOCKS \
+    +algorithm.prefix_correction.include_sampled_token=$INCLUDE_SAMPLED_TOKEN \
+    +algorithm.prefix_correction.use_prm_gate=$USE_PRM_GATE \
+    +algorithm.prefix_correction.use_value_delta=$USE_VALUE_DELTA \
+    +algorithm.prefix_correction.gate_mode=$PREFIX_GATE_MODE \
+    +algorithm.prefix_correction.ema_lambda=$PREFIX_EMA_LAMBDA \
+    +algorithm.prefix_correction.gate_ema_lambda=$PREFIX_EMA_LAMBDA \
+    +algorithm.prefix_correction.gate_alpha=$PREFIX_GATE_ALPHA \
+    +algorithm.prefix_correction.min_gate=$PREFIX_MIN_GATE \
+    +algorithm.prefix_correction.max_gate=$PREFIX_MAX_GATE \
+    +algorithm.prefix_correction.running_stats_momentum=$PREFIX_RUNNING_STATS_MOMENTUM \
+    +algorithm.prefix_correction.std_floor=$PREFIX_STD_FLOOR \
+    +algorithm.prefix_correction.value_delta_coef=$VALUE_DELTA_COEF \
+    +algorithm.prefix_correction.delta_clip=$PREFIX_DELTA_CLIP \
+    +algorithm.prefix_correction.delta_clip_z=$PREFIX_DELTA_CLIP_Z \
+    +algorithm.prefix_correction.prm_micro_batch_size=$PRM_MICRO_BATCH_SIZE \
+    +algorithm.prefix_correction.prm_dtype=$PRM_DTYPE"
+fi
+
+OUTCOME_OPD_MASK_ARGS=""
+if [ "$OUTCOME_OPD_MASK_ENABLE" = "True" ]; then
+    OUTCOME_OPD_MASK_ARGS="+algorithm.outcome_opd_mask.enable=True \
+    +algorithm.outcome_opd_mask.correct_threshold=$OUTCOME_OPD_CORRECT_THRESHOLD \
+    +algorithm.outcome_opd_mask.wrong_prefix_ratio=$OUTCOME_OPD_WRONG_PREFIX_RATIO \
+    +algorithm.outcome_opd_mask.min_prefix_tokens=$OUTCOME_OPD_MIN_PREFIX_TOKENS"
+fi
+
+RATIO_KL_SWITCH_ARGS=""
+if [ "$RATIO_KL_SWITCH_ENABLE" = "True" ]; then
+    RATIO_KL_SWITCH_ARGS="+algorithm.ratio_kl_switch.enable=True \
+    +algorithm.ratio_kl_switch.sample_distribution=$RATIO_KL_SWITCH_SAMPLE_DISTRIBUTION \
+    +algorithm.ratio_kl_switch.top_k=$RATIO_KL_SWITCH_TOP_K \
+    +algorithm.ratio_kl_switch.candidate_source=$RATIO_KL_SWITCH_CANDIDATE_SOURCE \
+    +algorithm.ratio_kl_switch.log_ratio_clip_min=$RATIO_KL_SWITCH_LOG_RATIO_CLIP_MIN"
+fi
 
 KL_ARGS=""
 if [ "$USE_KL" = "True" ]; then
@@ -164,13 +248,18 @@ PPO_MAX_TOKEN_LEN_PER_GPU=$(( ((1024 + MAX_RESP_LENGTH) > 32768) ? (1024 + MAX_R
 echo "PPO_MAX_TOKEN_LEN_PER_GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
 
 
-ray start --head
-sleep 5
+if [ "${SKIP_RAY_START:-False}" != "True" ]; then
+    ray start --head
+    sleep 5
+fi
 
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$ADV_ESTIMATOR \
     algorithm.grpo_outcome_weight=$GRPO_OUTCOME_WEIGHT \
+    $PREFIX_CORRECTION_ARGS \
+    $OUTCOME_OPD_MASK_ARGS \
+    $RATIO_KL_SWITCH_ARGS \
     data.shuffle=False \
     data.train_files="$TRAIN_DATASET" \
     data.val_files="$TEST_DATASET" \
@@ -232,17 +321,18 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=reward_func \
     trainer.val_before_train=False \
     trainer.log_val_generations=2 \
-    trainer.logger=['console','swanlab'] \
+    trainer.logger=['console'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.validation_data_dir=validation_log/$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
+    trainer.save_freq=100 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
     trainer.default_local_dir="$CKPT_PATH" \
-    trainer.is_plot=$IS_PLOT \
+    trainer.is_plot=$IS_PLOT
+MAIN_STATUS=$?
 
 # Log the end time for local runs.
 if [ -z "$SLURM_JOB_ID" ]; then
@@ -250,3 +340,4 @@ if [ -z "$SLURM_JOB_ID" ]; then
     echo "End time: $(date)"
     echo "=========================================="
 fi
+exit $MAIN_STATUS

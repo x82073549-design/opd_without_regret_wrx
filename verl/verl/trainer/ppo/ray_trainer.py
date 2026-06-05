@@ -178,6 +178,98 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+
+def apply_outcome_opd_mask(data: DataProto, config):
+    """Keep full OPD rewards for correct rollouts and a prefix for wrong rollouts."""
+    if config is None:
+        return data, {}
+
+    cfg = OmegaConf.to_container(config, resolve=True) if OmegaConf.is_config(config) else dict(config)
+    if not cfg.get("enable", False):
+        return data, {}
+
+    if "token_level_scores" not in data.batch.keys() or "response_mask" not in data.batch.keys():
+        return data, {}
+
+    scores = data.batch["token_level_scores"]
+    response_mask = data.batch["response_mask"].to(device=scores.device).float()
+    true_reward_score = data.batch.get("true_reward_score", None)
+    if true_reward_score is None:
+        return data, {}
+
+    true_reward_score = true_reward_score.to(device=scores.device)
+    if true_reward_score.dim() > 1:
+        true_reward_score = true_reward_score.sum(dim=-1)
+    true_reward_score = true_reward_score.view(-1)
+
+    threshold = float(cfg.get("correct_threshold", 0.5))
+    wrong_prefix_ratio = float(cfg.get("wrong_prefix_ratio", 0.25))
+    min_prefix_tokens = int(cfg.get("min_prefix_tokens", 1))
+    wrong_prefix_ratio = max(0.0, min(1.0, wrong_prefix_ratio))
+
+    batch_size, response_length = response_mask.shape
+    valid_lengths = response_mask.sum(dim=-1).long()
+    valid_response = valid_lengths > 0
+    correct_response = (true_reward_score > threshold) & valid_response
+    wrong_response = (~correct_response) & valid_response
+
+    wrong_keep_lengths = torch.ceil(valid_lengths.float() * wrong_prefix_ratio).long()
+    if min_prefix_tokens > 0:
+        min_keep = torch.full_like(wrong_keep_lengths, min_prefix_tokens)
+        wrong_keep_lengths = torch.where(valid_response, torch.maximum(wrong_keep_lengths, min_keep), wrong_keep_lengths)
+    wrong_keep_lengths = torch.minimum(wrong_keep_lengths, valid_lengths)
+
+    token_positions = torch.arange(response_length, device=scores.device).unsqueeze(0).expand(batch_size, -1)
+    wrong_prefix_mask = token_positions < wrong_keep_lengths.unsqueeze(-1)
+    keep_mask = torch.where(correct_response.unsqueeze(-1), response_mask.bool(), wrong_prefix_mask)
+    keep_mask = keep_mask & response_mask.bool()
+    keep_mask_float = keep_mask.to(dtype=scores.dtype)
+
+    if scores.dim() == response_mask.dim() + 1:
+        expanded_keep_mask = keep_mask_float.unsqueeze(-1)
+    elif scores.dim() == response_mask.dim():
+        expanded_keep_mask = keep_mask_float
+    else:
+        raise ValueError(
+            f"Unsupported token_level_scores shape {tuple(scores.shape)} for response_mask shape {tuple(response_mask.shape)}"
+        )
+
+    data.batch["token_level_scores"] = scores * expanded_keep_mask
+    if "rm_scores" in data.batch.keys():
+        rm_scores = data.batch["rm_scores"]
+        rm_keep_mask = keep_mask.to(device=rm_scores.device, dtype=rm_scores.dtype)
+        if rm_scores.dim() == response_mask.dim() + 1:
+            rm_keep_mask = rm_keep_mask.unsqueeze(-1)
+        data.batch["rm_scores"] = rm_scores * rm_keep_mask
+
+    valid_token_count = response_mask.sum()
+    kept_token_count = keep_mask_float.sum()
+    correct_token_mask = correct_response.float().unsqueeze(-1) * response_mask
+    wrong_token_mask = wrong_response.float().unsqueeze(-1) * response_mask
+    correct_token_count = correct_token_mask.sum()
+    wrong_token_count = wrong_token_mask.sum()
+    wrong_response_count = wrong_response.float().sum()
+    valid_response_count = valid_response.float().sum()
+
+    def safe_div(num, denom):
+        if denom.item() <= 0:
+            return 0.0
+        return (num / denom).item()
+
+    metrics = {
+        "opd_mask/enabled": 1.0,
+        "opd_mask/correct_ratio": safe_div(correct_response.float().sum(), valid_response_count),
+        "opd_mask/kept_token_ratio": safe_div(kept_token_count, valid_token_count),
+        "opd_mask/correct_kept_token_ratio": safe_div((keep_mask_float * correct_token_mask).sum(), correct_token_count),
+        "opd_mask/wrong_kept_token_ratio": safe_div((keep_mask_float * wrong_token_mask).sum(), wrong_token_count),
+        "opd_mask/wrong_avg_len": safe_div((valid_lengths.float() * wrong_response.float()).sum(), wrong_response_count),
+        "opd_mask/wrong_avg_keep_len": safe_div(
+            (wrong_keep_lengths.float() * wrong_response.float()).sum(), wrong_response_count
+        ),
+    }
+    return data, metrics
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -1103,6 +1195,8 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        prefix_correction = None
+                        prefix_correction_enabled = False
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             with marked_timer("compute_log_prob", timing_raw, color="blue"):
@@ -1119,6 +1213,50 @@ class RayPPOTrainer:
                             strategy = self.config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu")
                             kl_estimator = self.config.actor_rollout_ref.rollout.get("kl_estimator", "k1")
                             reward_weight_mode = self.config.actor_rollout_ref.rollout.get("reward_weight_mode", "student_p")
+                            prefix_correction_cfg = self.config.algorithm.get("prefix_correction", None)
+                            prefix_correction = None
+                            prefix_correction_enabled = False
+                            if prefix_correction_cfg is not None:
+                                prefix_correction = OmegaConf.to_container(prefix_correction_cfg, resolve=True)
+                                prefix_correction_enabled = bool(prefix_correction.get("enable", False))
+                                prefix_correction.setdefault("actor_tokenizer_path", self.config.actor_rollout_ref.model.path)
+
+                            ratio_kl_switch_cfg = self.config.algorithm.get("ratio_kl_switch", None)
+                            ratio_kl_switch = None
+                            ratio_kl_switch_enabled = False
+                            if ratio_kl_switch_cfg is not None:
+                                ratio_kl_switch = OmegaConf.to_container(ratio_kl_switch_cfg, resolve=True)
+                                ratio_kl_switch_enabled = bool(ratio_kl_switch.get("enable", False))
+                            if ratio_kl_switch_enabled:
+                                if top_k <= 0 or strategy != "only_stu":
+                                    raise ValueError("ratio_kl_switch currently requires top_k > 0 and top_k_strategy=only_stu")
+                                ratio_top_k = int(ratio_kl_switch.get("top_k", top_k))
+                                if ratio_top_k != top_k:
+                                    raise ValueError("ratio_kl_switch.top_k must match actor_rollout_ref.rollout.log_prob_top_k")
+
+                            if prefix_correction_enabled and top_k > 0 and strategy == "only_stu":
+                                sampled_ids = batch.batch["responses"].unsqueeze(-1)
+                                student_top_k_ids = batch.batch["student_top_k_ids"]
+                                generated_matches = student_top_k_ids == sampled_ids
+                                generated_in_topk = generated_matches.any(dim=-1)
+                                generated_topk_index = generated_matches.float().argmax(dim=-1).long()
+                                generated_topk_index = torch.where(
+                                    generated_in_topk, generated_topk_index, torch.zeros_like(generated_topk_index)
+                                )
+                                batch.batch["opd_generated_token_in_topk"] = generated_in_topk
+                                batch.batch["opd_generated_token_topk_index"] = generated_topk_index
+
+                                if prefix_correction.get("include_sampled_token", False):
+                                    sampled_log_probs = batch.batch["old_log_probs"].unsqueeze(-1)
+                                    batch.batch["student_top_k_ids"] = torch.cat([student_top_k_ids, sampled_ids], dim=-1)
+                                    batch.batch["student_top_k_log_probs"] = torch.cat(
+                                        [batch.batch["student_top_k_log_probs"], sampled_log_probs], dim=-1
+                                    )
+                                    candidate_kl_mask = torch.ones_like(batch.batch["student_top_k_ids"], dtype=torch.bool)
+                                    candidate_kl_mask[..., -1] = ~generated_in_topk
+                                    batch.batch["opd_candidate_kl_mask"] = candidate_kl_mask
+                                    batch.batch["opd_sampled_token_in_topk"] = generated_in_topk
+
 
                             # pass global_steps and is_plot config to rm_wg
                             batch.meta_info["global_steps"] = self.global_steps
@@ -1130,6 +1268,10 @@ class RayPPOTrainer:
                             batch.meta_info["kl_estimator"] = kl_estimator
                             batch.meta_info["reward_weight_mode"] = reward_weight_mode
                             batch.meta_info["teacher_temperature"] = teacher_temperature
+                            if prefix_correction_enabled:
+                                batch.meta_info["prefix_correction"] = prefix_correction
+                            if ratio_kl_switch_enabled:
+                                batch.meta_info["ratio_kl_switch"] = ratio_kl_switch
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
@@ -1142,9 +1284,144 @@ class RayPPOTrainer:
                                 with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
                                     distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
                                     batch = batch.union(distillation_output)
+
+                                if ratio_kl_switch_enabled:
+                                    try:
+                                        response_mask = batch.batch["response_mask"].float()
+                                        mask_denom = response_mask.sum().clamp_min(1.0)
+
+                                        def masked_mean_2d(value):
+                                            return ((value.float() * response_mask).sum() / mask_denom).item()
+
+                                        def masked_std_2d(value):
+                                            value = value.float()
+                                            mean = (value * response_mask).sum() / mask_denom
+                                            var = (((value - mean) ** 2) * response_mask).sum() / mask_denom
+                                            return torch.sqrt(var.clamp_min(0.0)).item()
+
+                                        q = batch.batch.get("ratio_switch_q", None)
+                                        if q is not None:
+                                            metrics["ratio_switch/q_mean"] = masked_mean_2d(q)
+                                            metrics["ratio_switch/q_std"] = masked_std_2d(q)
+                                            valid_q = q.float()[response_mask.bool()]
+                                            if valid_q.numel() > 0:
+                                                metrics["ratio_switch/q_min"] = valid_q.min().item()
+                                                metrics["ratio_switch/q_max"] = valid_q.max().item()
+                                        rkl_mask = batch.batch.get("ratio_switch_rkl_mask", None)
+                                        if rkl_mask is not None:
+                                            rkl_ratio = (rkl_mask.float() * response_mask).sum() / mask_denom
+                                            metrics["ratio_switch/rkl_token_ratio"] = rkl_ratio.item()
+                                            metrics["ratio_switch/fkl_token_ratio"] = (1.0 - rkl_ratio).item()
+                                        metric_key_map = {
+                                            "ratio_switch_teacher_sampled_prob": "ratio_switch/teacher_sampled_p_mean",
+                                            "ratio_switch_student_sampled_prob": "ratio_switch/student_sampled_p_mean",
+                                            "ratio_switch_log_ratio": "ratio_switch/log_ratio_mean",
+                                            "ratio_switch_sample_in_topk": "ratio_switch/sample_token_in_student_topk_ratio",
+                                            "ratio_switch_rkl_adv_mean_token": "ratio_switch/rkl_adv_mean",
+                                            "ratio_switch_rkl_adv_abs_mean_token": "ratio_switch/rkl_adv_abs_mean",
+                                            "ratio_switch_fkl_adv_mean_token": "ratio_switch/fkl_adv_mean",
+                                            "ratio_switch_fkl_adv_abs_mean_token": "ratio_switch/fkl_adv_abs_mean",
+                                            "ratio_switch_mixed_adv_abs_mean_token": "ratio_switch/mixed_adv_abs_mean",
+                                        }
+                                        for tensor_key, metric_key in metric_key_map.items():
+                                            value = batch.batch.get(tensor_key, None)
+                                            if value is not None:
+                                                metrics[metric_key] = masked_mean_2d(value)
+                                        log_ratio = batch.batch.get("ratio_switch_log_ratio", None)
+                                        if log_ratio is not None:
+                                            metrics["ratio_switch/log_ratio_std"] = masked_std_2d(log_ratio)
+                                    except Exception as e:
+                                        print(f"Error logging ratio_kl_switch metrics: {e}")
+
+                                if prefix_correction_enabled:
+                                    try:
+                                        response_mask = batch.batch["response_mask"].float()
+                                        mask_denom = response_mask.sum().clamp_min(1.0)
+
+                                        def masked_mean(value, mask):
+                                            denom = mask.sum().clamp_min(1.0)
+                                            return (value * mask).sum() / denom
+
+                                        def masked_std(value, mask):
+                                            mean = masked_mean(value, mask)
+                                            denom = mask.sum().clamp_min(1.0)
+                                            var = (((value - mean) ** 2) * mask).sum() / denom
+                                            return torch.sqrt(var.clamp_min(0.0))
+
+                                        if "prefix_value" in batch.batch.keys():
+                                            prefix_value = batch.batch["prefix_value"].float()
+                                            value_mask = response_mask
+                                            if "prefix_value_mask" in batch.batch.keys():
+                                                value_mask = value_mask * batch.batch["prefix_value_mask"].float()
+                                            value_denom = value_mask.sum().clamp_min(1.0)
+                                            metrics["prefix_value/mean"] = ((prefix_value * value_mask).sum() / value_denom).item()
+                                            metrics["prefix_value/std"] = masked_std(prefix_value, value_mask).item()
+                                            valid_values = prefix_value[value_mask.bool()]
+                                            if valid_values.numel() > 0:
+                                                metrics["prefix_value/min"] = valid_values.min().item()
+                                                metrics["prefix_value/max"] = valid_values.max().item()
+                                        if "prefix_gate" in batch.batch.keys():
+                                            prefix_gate = batch.batch["prefix_gate"].float()
+                                            metrics["prefix_gate/mean"] = ((prefix_gate * response_mask).sum() / mask_denom).item()
+                                            metrics["prefix_gate/std"] = masked_std(prefix_gate, response_mask).item()
+                                            metrics["prefix_gate/low_ratio"] = (((prefix_gate < 0.5).float() * response_mask).sum() / mask_denom).item()
+                                            if "prefix_gate_raw" in batch.batch.keys():
+                                                prefix_gate_raw = batch.batch["prefix_gate_raw"].float()
+                                                min_gate_value = float(prefix_correction.get("min_gate", 0.5))
+                                                max_gate_value = float(prefix_correction.get("max_gate", 1.5))
+                                                metrics["prefix_gate/floor_ratio"] = (
+                                                    (((prefix_gate_raw <= min_gate_value + 1e-6).float()) * response_mask).sum() / mask_denom
+                                                ).item()
+                                                metrics["prefix_gate/cap_ratio"] = (
+                                                    (((prefix_gate_raw >= max_gate_value - 1e-6).float()) * response_mask).sum() / mask_denom
+                                                ).item()
+                                        if "prefix_value_delta" in batch.batch.keys():
+                                            prefix_delta = batch.batch["prefix_value_delta"].float()
+                                            metrics["prefix_delta/mean"] = ((prefix_delta * response_mask).sum() / mask_denom).item()
+                                            metrics["prefix_delta/abs_mean"] = ((prefix_delta.abs() * response_mask).sum() / mask_denom).item()
+                                            metrics["prefix_delta/std"] = masked_std(prefix_delta, response_mask).item()
+                                            metrics["prefix_delta/pos_ratio"] = (((prefix_delta > 0).float() * response_mask).sum() / mask_denom).item()
+                                            metrics["prefix_delta/neg_ratio"] = (((prefix_delta < 0).float() * response_mask).sum() / mask_denom).item()
+                                            if "opd_generated_token_in_topk" in batch.batch.keys():
+                                                delta_nonzero = (prefix_delta.abs() > 1e-12).float() * response_mask
+                                                delta_nonzero_denom = delta_nonzero.sum().clamp_min(1.0)
+                                                generated_in_topk = batch.batch["opd_generated_token_in_topk"].float()
+                                                metrics["prefix_delta/applied_ratio"] = (
+                                                    (delta_nonzero * generated_in_topk).sum() / delta_nonzero_denom
+                                                ).item()
+                                        if "prefix_stats_ready" in batch.batch.keys():
+                                            stats_ready = batch.batch["prefix_stats_ready"].float()
+                                            metrics["prefix_value/stats_ready_ratio"] = ((stats_ready * response_mask).sum() / mask_denom).item()
+                                        if "prefix_value_std_floor_active" in batch.batch.keys():
+                                            floor_active = batch.batch["prefix_value_std_floor_active"].float()
+                                            metrics["prefix_value/std_floor_active_ratio"] = (
+                                                (floor_active * response_mask).sum() / mask_denom
+                                            ).item()
+                                        if "opd_generated_token_in_topk" in batch.batch.keys():
+                                            generated_in_topk = batch.batch["opd_generated_token_in_topk"].float()
+                                            metrics["opd/generated_token_in_topk_ratio"] = (
+                                                (generated_in_topk * response_mask).sum() / mask_denom
+                                            ).item()
+                                        if "opd_sampled_token_in_topk" in batch.batch.keys():
+                                            sampled_in_topk = batch.batch["opd_sampled_token_in_topk"].float()
+                                            metrics["opd/sampled_token_in_topk_ratio"] = ((sampled_in_topk * response_mask).sum() / mask_denom).item()
+                                        if "opd_candidate_kl_mask" in batch.batch.keys():
+                                            candidate_kl_mask = batch.batch["opd_candidate_kl_mask"].float()
+                                            metrics["opd/effective_candidate_count"] = (
+                                                (candidate_kl_mask.sum(dim=-1) * response_mask).sum() / mask_denom
+                                            ).item()
+                                        elif "student_top_k_ids" in batch.batch.keys():
+                                            metrics["opd/effective_candidate_count"] = float(batch.batch["student_top_k_ids"].shape[-1])
+                                    except Exception as e:
+                                        print(f"Error logging prefix correction metrics: {e}")
                         
                         # Plot overlapping tokens for Reverse KL
-                        if (self.global_steps == 1 or self.global_steps % 10 == 0) and "student_valid_counts" in batch.batch.keys():
+                        if (
+                            self.config.trainer.get("is_plot", False)
+                            and "swanlab" in self.config.trainer.logger
+                            and (self.global_steps == 1 or self.global_steps % 10 == 0)
+                            and "student_valid_counts" in batch.batch.keys()
+                        ):
                             try:
                                 import matplotlib.pyplot as plt
                                 import swanlab
@@ -1339,7 +1616,8 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
-                        if "true_reward_score" in reward_extra_infos_dict:
+                        has_explicit_true_reward_score = "true_reward_score" in reward_extra_infos_dict
+                        if has_explicit_true_reward_score:
                             true_reward_val = reward_extra_infos_dict["true_reward_score"]
                             if isinstance(true_reward_val, torch.Tensor):
                                 batch.batch["true_reward_score"] = true_reward_val
@@ -1354,6 +1632,66 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        outcome_opd_mask_cfg = self.config.algorithm.get("outcome_opd_mask", None)
+                        if outcome_opd_mask_cfg is not None and outcome_opd_mask_cfg.get("enable", False):
+                            if has_explicit_true_reward_score:
+                                batch, outcome_opd_mask_metrics = apply_outcome_opd_mask(batch, outcome_opd_mask_cfg)
+                                metrics.update(outcome_opd_mask_metrics)
+                            else:
+                                metrics["opd_mask/skipped_no_true_reward_score"] = 1.0
+
+                        if ratio_kl_switch_enabled and "ratio_switch_rkl_mask" in batch.batch.keys():
+                            try:
+                                response_mask = batch.batch["response_mask"].float()
+                                true_reward_score = batch.batch["true_reward_score"]
+                                if true_reward_score.dim() > 1:
+                                    true_reward_score = true_reward_score.sum(dim=-1)
+                                rkl_mask = batch.batch["ratio_switch_rkl_mask"].float()
+                                correct_mask = (true_reward_score > 0.5).float().unsqueeze(-1) * response_mask
+                                wrong_mask = (true_reward_score <= 0.5).float().unsqueeze(-1) * response_mask
+                                correct_denom = correct_mask.sum()
+                                wrong_denom = wrong_mask.sum()
+                                if correct_denom > 0:
+                                    metrics["ratio_switch/correct_rkl_token_ratio"] = (
+                                        (rkl_mask * correct_mask).sum() / correct_denom
+                                    ).item()
+                                if wrong_denom > 0:
+                                    metrics["ratio_switch/wrong_rkl_token_ratio"] = (
+                                        (rkl_mask * wrong_mask).sum() / wrong_denom
+                                    ).item()
+                            except Exception as e:
+                                print(f"Error logging ratio_kl_switch correctness metrics: {e}")
+
+                        if prefix_correction_enabled and "prefix_value" in batch.batch.keys():
+                            try:
+                                response_mask = batch.batch["response_mask"].float()
+                                prefix_value = batch.batch["prefix_value"].float()
+                                prefix_gate = batch.batch.get("prefix_gate", None)
+                                value_mask = response_mask
+                                if "prefix_value_mask" in batch.batch.keys():
+                                    value_mask = value_mask * batch.batch["prefix_value_mask"].float()
+                                true_reward_score = batch.batch["true_reward_score"]
+                                if true_reward_score.dim() > 1:
+                                    true_reward_score = true_reward_score.sum(dim=-1)
+                                correct_mask = (true_reward_score > 0.5).float().unsqueeze(-1) * value_mask
+                                wrong_mask = (true_reward_score <= 0.5).float().unsqueeze(-1) * value_mask
+                                correct_denom = correct_mask.sum()
+                                wrong_denom = wrong_mask.sum()
+                                if correct_denom > 0:
+                                    metrics["prefix_value/correct_mean"] = ((prefix_value * correct_mask).sum() / correct_denom).item()
+                                    if prefix_gate is not None:
+                                        metrics["prefix_gate/correct_mean"] = (
+                                            (prefix_gate.float() * correct_mask).sum() / correct_denom
+                                        ).item()
+                                if wrong_denom > 0:
+                                    metrics["prefix_value/wrong_mean"] = ((prefix_value * wrong_mask).sum() / wrong_denom).item()
+                                    if prefix_gate is not None:
+                                        metrics["prefix_gate/wrong_mean"] = (
+                                            (prefix_gate.float() * wrong_mask).sum() / wrong_denom
+                                        ).item()
+                            except Exception as e:
+                                print(f"Error logging prefix correction correctness metrics: {e}")
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -2049,7 +2387,11 @@ class RayPPOTrainer:
                                 import traceback
                                 traceback.print_exc()
                     
-                    if self.config.trainer.get("is_plot", False) and (self.global_steps == 1 or self.global_steps % 10 == 0):
+                    if (
+                        self.config.trainer.get("is_plot", False)
+                        and "swanlab" in self.config.trainer.logger
+                        and (self.global_steps == 1 or self.global_steps % 10 == 0)
+                    ):
                         try:
                             import matplotlib.pyplot as plt
                             import swanlab
@@ -2236,9 +2578,32 @@ class RayPPOTrainer:
                         "teacher_top_k_ids",
                         "teacher_top_k_log_probs",
                         "teacher_entropy",
+                        "teacher_response_log_probs",
                         "overlap_mask",
                         "teacher_in_student_mask",
                         "student_log_probs_on_teacher_ids",
+                        "ratio_switch_q",
+                        "ratio_switch_rkl_mask",
+                        "ratio_switch_log_ratio",
+                        "ratio_switch_teacher_sampled_prob",
+                        "ratio_switch_student_sampled_prob",
+                        "ratio_switch_sample_in_topk",
+                        "ratio_switch_rkl_adv_mean_token",
+                        "ratio_switch_rkl_adv_abs_mean_token",
+                        "ratio_switch_fkl_adv_mean_token",
+                        "ratio_switch_fkl_adv_abs_mean_token",
+                        "ratio_switch_mixed_adv_abs_mean_token",
+                        "prefix_gate",
+                        "prefix_value_delta",
+                        "prefix_value",
+                        "prefix_value_mask",
+                        "prefix_gate_raw",
+                        "prefix_stats_ready",
+                        "prefix_value_std_floor_active",
+                        "opd_candidate_kl_mask",
+                        "opd_sampled_token_in_topk",
+                        "opd_generated_token_in_topk",
+                        "opd_generated_token_topk_index",
                     ]
                     for key in keys_to_pop:
                         if key in batch.batch.keys():

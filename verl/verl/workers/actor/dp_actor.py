@@ -463,6 +463,8 @@ class DataParallelPPOActor(BasePPOActor):
         strategy = data.meta_info.get("top_k_strategy", "only_stu")
         kl_estimator = data.meta_info.get("kl_estimator", "k1")
         reward_weight_mode = data.meta_info.get("reward_weight_mode", "student_p")  # "student_p", "teacher_p", or "none"
+        ratio_kl_switch_cfg = data.meta_info.get("ratio_kl_switch", None)
+        ratio_kl_switch_enabled = bool(ratio_kl_switch_cfg.get("enable", False)) if ratio_kl_switch_cfg is not None else False
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -518,6 +520,18 @@ class DataParallelPPOActor(BasePPOActor):
         if T_logp is not None: T_logp = T_logp.to(device)
         overlap_mask = data.batch.get("overlap_mask", None)
         if overlap_mask is not None: overlap_mask = overlap_mask.to(device)
+        candidate_kl_mask = data.batch.get("opd_candidate_kl_mask", None)
+        if candidate_kl_mask is not None: candidate_kl_mask = candidate_kl_mask.to(device).bool()
+        prefix_gate = data.batch.get("prefix_gate", None)
+        if prefix_gate is not None: prefix_gate = prefix_gate.to(device).to(S_logp.dtype)
+        prefix_value_delta = data.batch.get("prefix_value_delta", None)
+        if prefix_value_delta is not None: prefix_value_delta = prefix_value_delta.to(device).to(S_logp.dtype)
+        generated_topk_index = data.batch.get("opd_generated_token_topk_index", None)
+        if generated_topk_index is not None: generated_topk_index = generated_topk_index.to(device).long()
+        generated_in_topk = data.batch.get("opd_generated_token_in_topk", None)
+        if generated_in_topk is not None: generated_in_topk = generated_in_topk.to(device).bool()
+        response_mask = data.batch.get("response_mask", None)
+        if response_mask is not None: response_mask = response_mask.to(device).bool()
 
         def compute_reward_weights(S_logp, T_logp, valid_mask, weight_mode, normalize=True):
             """Compute weights for reward calculation.
@@ -558,10 +572,95 @@ class DataParallelPPOActor(BasePPOActor):
         res_tensors = {}
         
         if strategy == "only_stu":
-            kl_val = S_logp - T_on_S
             valid_mask = torch.ones_like(S_logp, dtype=torch.bool)
-            norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
-            rm_scores = -kl_val * norm_weights
+            if candidate_kl_mask is not None:
+                valid_mask = valid_mask & candidate_kl_mask
+
+            if ratio_kl_switch_enabled:
+                sample_distribution = ratio_kl_switch_cfg.get("sample_distribution", "bernoulli")
+                candidate_source = ratio_kl_switch_cfg.get("candidate_source", "student_topk")
+                ratio_top_k = int(ratio_kl_switch_cfg.get("top_k", top_k))
+                if sample_distribution != "bernoulli":
+                    raise ValueError(f"Unsupported ratio_kl_switch.sample_distribution: {sample_distribution}")
+                if candidate_source != "student_topk":
+                    raise ValueError(f"Unsupported ratio_kl_switch.candidate_source: {candidate_source}")
+                if ratio_top_k != S_logp.shape[-1]:
+                    raise ValueError(
+                        f"ratio_kl_switch.top_k={ratio_top_k} must match candidate dim {S_logp.shape[-1]}"
+                    )
+                if "teacher_response_log_probs" not in data.batch.keys():
+                    raise ValueError("ratio_kl_switch requires teacher_response_log_probs from reward worker")
+
+                s_masked_logp = torch.where(valid_mask, S_logp, torch.full_like(S_logp, -float("inf")))
+                t_masked_logp = torch.where(valid_mask, T_on_S, torch.full_like(T_on_S, -float("inf")))
+                s_norm_logp = s_masked_logp - torch.logsumexp(s_masked_logp, dim=-1, keepdim=True)
+                t_norm_logp = t_masked_logp - torch.logsumexp(t_masked_logp, dim=-1, keepdim=True)
+                s_norm_logp = torch.where(valid_mask, s_norm_logp, torch.zeros_like(s_norm_logp))
+                t_norm_logp = torch.where(valid_mask, t_norm_logp, torch.zeros_like(t_norm_logp))
+                s_norm_logp = torch.nan_to_num(s_norm_logp, nan=0.0, posinf=0.0, neginf=0.0)
+                t_norm_logp = torch.nan_to_num(t_norm_logp, nan=0.0, posinf=0.0, neginf=0.0)
+                s_norm_p = torch.where(valid_mask, torch.exp(s_norm_logp), torch.zeros_like(S_logp))
+                t_norm_p = torch.where(valid_mask, torch.exp(t_norm_logp), torch.zeros_like(T_on_S))
+
+                rkl_gap = torch.where(valid_mask, s_norm_logp - t_norm_logp, torch.zeros_like(S_logp))
+                rkl_adv = -s_norm_p * rkl_gap
+                fkl_adv = t_norm_p
+
+                teacher_sampled_logp = data.batch["teacher_response_log_probs"].to(device).to(S_logp.dtype)
+                student_sampled_logp = data.batch["old_log_probs"].to(device).to(S_logp.dtype)
+                log_ratio_raw = teacher_sampled_logp - student_sampled_logp
+                log_ratio_clip_min = float(ratio_kl_switch_cfg.get("log_ratio_clip_min", -80.0))
+                log_ratio_for_q = torch.clamp(log_ratio_raw.float(), min=log_ratio_clip_min, max=0.0)
+                trust_q = torch.exp(log_ratio_for_q).to(S_logp.dtype)
+
+                if response_mask is None:
+                    token_valid_mask = torch.ones_like(trust_q, dtype=torch.bool)
+                else:
+                    token_valid_mask = response_mask
+                rkl_token_mask_bool = (torch.rand_like(trust_q.float()) < trust_q.float()) & token_valid_mask
+                rkl_token_mask = rkl_token_mask_bool.to(S_logp.dtype)
+                fkl_token_mask = (token_valid_mask & ~rkl_token_mask_bool).to(S_logp.dtype)
+
+                rm_scores = rkl_token_mask.unsqueeze(-1) * rkl_adv + fkl_token_mask.unsqueeze(-1) * fkl_adv
+                rm_scores = torch.where(token_valid_mask.unsqueeze(-1), rm_scores, torch.zeros_like(rm_scores))
+                rm_scores = torch.nan_to_num(rm_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+                sampled_ids = data.batch["responses"].to(device).unsqueeze(-1)
+                sampled_in_topk = (S_ids == sampled_ids).any(dim=-1)
+
+                prob_clip_min = min(log_ratio_clip_min, -80.0)
+                res_tensors["ratio_switch_q"] = trust_q.detach()
+                res_tensors["ratio_switch_rkl_mask"] = rkl_token_mask.detach()
+                res_tensors["ratio_switch_log_ratio"] = log_ratio_raw.detach()
+                res_tensors["ratio_switch_teacher_sampled_prob"] = torch.exp(
+                    torch.clamp(teacher_sampled_logp.float(), min=prob_clip_min, max=0.0)
+                ).to(S_logp.dtype).detach()
+                res_tensors["ratio_switch_student_sampled_prob"] = torch.exp(
+                    torch.clamp(student_sampled_logp.float(), min=prob_clip_min, max=0.0)
+                ).to(S_logp.dtype).detach()
+                res_tensors["ratio_switch_sample_in_topk"] = sampled_in_topk.to(S_logp.dtype).detach()
+                res_tensors["ratio_switch_rkl_adv_mean_token"] = rkl_adv.mean(dim=-1).detach()
+                res_tensors["ratio_switch_rkl_adv_abs_mean_token"] = rkl_adv.abs().mean(dim=-1).detach()
+                res_tensors["ratio_switch_fkl_adv_mean_token"] = fkl_adv.mean(dim=-1).detach()
+                res_tensors["ratio_switch_fkl_adv_abs_mean_token"] = fkl_adv.abs().mean(dim=-1).detach()
+                res_tensors["ratio_switch_mixed_adv_abs_mean_token"] = rm_scores.abs().mean(dim=-1).detach()
+            else:
+                kl_val = S_logp - T_on_S
+                kl_val = torch.where(valid_mask, kl_val, torch.zeros_like(kl_val))
+                norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
+                rm_scores = -kl_val * norm_weights
+
+            if prefix_gate is not None:
+                rm_scores = rm_scores * prefix_gate.unsqueeze(-1)
+            if prefix_value_delta is not None:
+                if generated_topk_index is not None and generated_in_topk is not None:
+                    delta_updates = torch.zeros_like(rm_scores)
+                    safe_index = generated_topk_index.clamp(min=0, max=rm_scores.shape[-1] - 1).unsqueeze(-1)
+                    delta_values = prefix_value_delta.masked_fill(~generated_in_topk, 0.0).unsqueeze(-1)
+                    delta_updates.scatter_add_(-1, safe_index, delta_values)
+                    rm_scores = rm_scores + delta_updates
+                elif rm_scores.shape[-1] > top_k:
+                    rm_scores[..., -1] = rm_scores[..., -1] + prefix_value_delta
             
         elif strategy == "only_tch":
             kl_val = S_on_T - T_logp

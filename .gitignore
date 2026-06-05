@@ -1,0 +1,38 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and secrets
+.conda-envs/
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+env.sh
+
+# Training, evaluation, and experiment outputs
+checkpoint/
+logs/
+outputs/
+justrl_eval_outputs/
+wandb/
+runs/
+
+# Local model downloads
+model/
+models/
+
+# Generated local dataset slices
+datasets/*_2k.parquet
+datasets/*-2k.parquet
+
+# Tool and runtime caches
+.cache/
+*.log
+*.tmp

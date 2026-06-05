@@ -1675,6 +1675,15 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         import torch.distributed
 
         self.config = config
+        self._prefix_prm_model = None
+        self._prefix_prm_tokenizer = None
+        self._prefix_actor_tokenizer = None
+        self._prefix_prm_model_path = None
+        self._prefix_actor_tokenizer_path = None
+        self._prefix_piece_cache = {}
+        self._prefix_value_running_mean = None
+        self._prefix_value_running_sq_mean = None
+        self._prefix_value_running_count = 0
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(),
@@ -2550,6 +2559,489 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         return DataProto.from_dict(rm_inputs)
 
+    def _prefix_correction_is_enabled(self, prefix_config):
+        return bool(prefix_config and prefix_config.get("enable", False)) and (
+            bool(prefix_config.get("use_prm_gate", True)) or bool(prefix_config.get("use_value_delta", True))
+        )
+
+    def _ensure_prefix_prm(self, prefix_config):
+        prm_model_path = prefix_config.get("prm_model_path")
+        if prm_model_path is None:
+            raise ValueError("algorithm.prefix_correction.prm_model_path must be set when prefix correction is enabled")
+        actor_tokenizer_path = prefix_config.get("actor_tokenizer_path", self.config.model.path)
+        prm_model_path = copy_to_local(prm_model_path, use_shm=False)
+        actor_tokenizer_path = copy_to_local(actor_tokenizer_path, use_shm=False)
+
+        if self._prefix_prm_model is None or self._prefix_prm_model_path != prm_model_path:
+            import time
+            from accelerate import init_empty_weights
+            from transformers import AutoConfig, AutoModel, AutoTokenizer
+            from verl.utils.torch_dtypes import PrecisionType
+
+            load_start = time.time()
+            dtype_name = prefix_config.get("prm_dtype", "bf16")
+            prm_dtype = PrecisionType.to_dtype(dtype_name)
+            print(
+                f"[prefix_correction][rank={self.rank}] loading PRM tokenizer from {prm_model_path}",
+                flush=True,
+            )
+            self._prefix_prm_tokenizer = AutoTokenizer.from_pretrained(prm_model_path, trust_remote_code=True)
+            print(
+                f"[prefix_correction][rank={self.rank}] PRM tokenizer loaded in {time.time() - load_start:.1f}s",
+                flush=True,
+            )
+            prm_model_config = AutoConfig.from_pretrained(prm_model_path, trust_remote_code=True)
+            prm_model_config.torch_dtype = prm_dtype
+            with init_empty_weights(), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self._prefix_prm_model = AutoModel.from_config(
+                    prm_model_config,
+                    trust_remote_code=True,
+                )
+
+            safetensors_path = os.path.join(prm_model_path, "model.safetensors")
+            bin_path = os.path.join(prm_model_path, "pytorch_model.bin")
+            if os.path.exists(safetensors_path):
+                from safetensors.torch import load_file
+
+                state_dict = load_file(safetensors_path, device="cpu")
+                weight_path = safetensors_path
+            elif os.path.exists(bin_path):
+                state_dict = torch.load(bin_path, map_location="cpu", weights_only=True, mmap=True)
+                weight_path = bin_path
+            else:
+                raise FileNotFoundError(
+                    f"No supported PRM weight file found in {prm_model_path}; "
+                    "expected model.safetensors or pytorch_model.bin"
+                )
+
+            missing_keys, unexpected_keys = self._prefix_prm_model.load_state_dict(
+                state_dict,
+                strict=False,
+                assign=True,
+            )
+            del state_dict
+            allowed_unexpected = {"lm_head.weight"}
+            bad_unexpected = [key for key in unexpected_keys if key not in allowed_unexpected]
+            if missing_keys or bad_unexpected:
+                raise RuntimeError(
+                    "Failed to load PRM weights with prefix correction fast path: "
+                    f"missing={missing_keys}, unexpected={unexpected_keys}"
+                )
+            print(
+                f"[prefix_correction][rank={self.rank}] PRM weights loaded from {weight_path} "
+                f"in {time.time() - load_start:.1f}s; unexpected={unexpected_keys}",
+                flush=True,
+            )
+            self._prefix_prm_model = self._prefix_prm_model.to(device=get_device_id(), dtype=prm_dtype)
+            self._prefix_prm_model.eval()
+            self._prefix_prm_model_path = prm_model_path
+            print(
+                f"[prefix_correction][rank={self.rank}] PRM moved to device in {time.time() - load_start:.1f}s",
+                flush=True,
+            )
+
+        if self._prefix_actor_tokenizer is None or self._prefix_actor_tokenizer_path != actor_tokenizer_path:
+            self._prefix_actor_tokenizer = hf_tokenizer(actor_tokenizer_path, trust_remote_code=True)
+            self._prefix_actor_tokenizer_path = actor_tokenizer_path
+            self._prefix_piece_cache.clear()
+
+    def _decode_with_actor_tokenizer(self, token_ids):
+        return self._prefix_actor_tokenizer.decode(
+            token_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def _token_prefix_char_lens(self, token_ids, decoded_text):
+        token_ids = [int(token_id) for token_id in token_ids]
+
+        try:
+            encoded = self._prefix_actor_tokenizer(
+                decoded_text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            encoded_ids = [int(token_id) for token_id in encoded["input_ids"]]
+            offsets = encoded["offset_mapping"]
+            if encoded_ids == token_ids and len(offsets) == len(token_ids):
+                prefix_lens = [0]
+                for _, char_end in offsets:
+                    prefix_lens.append(int(char_end))
+                if prefix_lens[-1] == len(decoded_text):
+                    return prefix_lens
+        except Exception:
+            pass
+
+        prefix_lens = [0]
+        total = 0
+        for token_id_int in token_ids:
+            piece = self._prefix_piece_cache.get(token_id_int)
+            if piece is None:
+                piece = self._decode_with_actor_tokenizer([token_id_int])
+                self._prefix_piece_cache[token_id_int] = piece
+            total += len(piece)
+            prefix_lens.append(total)
+
+        if total != len(decoded_text):
+            raise RuntimeError(
+                "Cannot map prefix correction char spans to original response ids without changing token ids: "
+                f"decoded text length={len(decoded_text)}, piece prefix length={total}"
+            )
+        return prefix_lens
+
+    @staticmethod
+    def _char_span_to_token_span(prefix_lens, char_start, char_end):
+        import bisect
+
+        valid_len = len(prefix_lens) - 1
+        token_start = bisect.bisect_right(prefix_lens, char_start) - 1
+        token_end = bisect.bisect_left(prefix_lens, char_end)
+        token_start = max(0, min(valid_len, token_start))
+        token_end = max(0, min(valid_len, token_end))
+        if char_end > char_start and token_end <= token_start:
+            token_end = min(valid_len, token_start + 1)
+        return token_start, token_end
+
+    @staticmethod
+    def _split_delimiter_grouped(response_text, delimiter, n_prm_blocks):
+        if not response_text:
+            return []
+        parts = response_text.split(delimiter)
+        raw_spans = []
+        pos = 0
+        delim_len = len(delimiter)
+        for idx, part in enumerate(parts):
+            part_start = pos
+            part_end = part_start + len(part)
+            next_pos = part_end + (delim_len if idx < len(parts) - 1 else 0)
+            if part.strip():
+                raw_spans.append((part_start, next_pos))
+            pos = next_pos
+
+        if not raw_spans:
+            raw_spans = [(0, len(response_text))]
+
+        raw_block_num = len(raw_spans)
+        n_prm_blocks = max(1, int(n_prm_blocks))
+        group_size = max(1, (raw_block_num + n_prm_blocks - 1) // n_prm_blocks)
+        grouped = []
+        for start in range(0, raw_block_num, group_size):
+            end = min(raw_block_num, start + group_size)
+            char_start = raw_spans[start][0]
+            char_end = raw_spans[end - 1][1]
+            grouped.append((char_start, char_end, response_text[char_start:char_end]))
+        return grouped
+
+    def _delimiter_token_candidates(self, delimiter):
+        candidates = []
+
+        def add_candidate(token_ids):
+            candidate = tuple(int(token_id) for token_id in token_ids)
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        add_candidate(self._prefix_actor_tokenizer.encode(delimiter, add_special_tokens=False))
+        double_lf = chr(10) * 2
+        if delimiter == double_lf:
+            newline_ids = self._prefix_actor_tokenizer.encode(chr(10), add_special_tokens=False)
+            add_candidate(newline_ids + newline_ids)
+        candidates.sort(key=len, reverse=True)
+        return candidates
+
+    def _split_delimiter_grouped_token_spans(self, token_ids, delimiter, n_prm_blocks):
+        if not token_ids:
+            return []
+        token_ids = [int(token_id) for token_id in token_ids]
+        delimiter_candidates = self._delimiter_token_candidates(delimiter)
+        raw_spans = []
+        block_start = 0
+        pos = 0
+        while pos < len(token_ids):
+            matched_len = 0
+            for candidate in delimiter_candidates:
+                cand_len = len(candidate)
+                if cand_len and tuple(token_ids[pos : pos + cand_len]) == candidate:
+                    matched_len = cand_len
+                    break
+            if matched_len == 0 and delimiter:
+                token_id = token_ids[pos]
+                piece = self._prefix_piece_cache.get(token_id)
+                if piece is None:
+                    piece = self._decode_with_actor_tokenizer([token_id])
+                    self._prefix_piece_cache[token_id] = piece
+                if delimiter in piece:
+                    matched_len = 1
+
+            if matched_len > 0:
+                block_end = min(len(token_ids), pos + matched_len)
+                block_text = self._decode_with_actor_tokenizer(token_ids[block_start:block_end])
+                if block_text.strip():
+                    raw_spans.append((block_start, block_end))
+                block_start = block_end
+                pos = block_end
+            else:
+                pos += 1
+
+        if block_start < len(token_ids):
+            block_text = self._decode_with_actor_tokenizer(token_ids[block_start:])
+            if block_text.strip():
+                raw_spans.append((block_start, len(token_ids)))
+
+        if not raw_spans:
+            raw_spans = [(0, len(token_ids))]
+
+        raw_block_num = len(raw_spans)
+        n_prm_blocks = max(1, int(n_prm_blocks))
+        group_size = max(1, (raw_block_num + n_prm_blocks - 1) // n_prm_blocks)
+        grouped = []
+        for start in range(0, raw_block_num, group_size):
+            end = min(raw_block_num, start + group_size)
+            token_start = raw_spans[start][0]
+            token_end = raw_spans[end - 1][1]
+            block_text = self._decode_with_actor_tokenizer(token_ids[token_start:token_end])
+            if token_end > token_start and block_text.strip():
+                grouped.append((token_start, token_end, block_text))
+        return grouped
+
+    def _build_prm_input(self, prompt_text, block_texts, step_token):
+        tokenizer = self._prefix_prm_tokenizer
+        input_ids = tokenizer.encode(prompt_text + (chr(10) * 2), add_special_tokens=False)
+        reward_flags = []
+        for block_text in block_texts:
+            step_text = block_text.strip()
+            if not step_text:
+                continue
+            step_ids = tokenizer.encode(step_text + step_token, add_special_tokens=False)
+            if not step_ids:
+                continue
+            input_ids.extend(step_ids)
+            reward_flags.append(len(input_ids) - 1)
+        if not input_ids:
+            input_ids = [tokenizer.eos_token_id or tokenizer.pad_token_id]
+        return input_ids, reward_flags
+
+    def _score_prm_examples(self, prm_examples, prefix_config):
+        if not prm_examples:
+            return []
+
+        tokenizer = self._prefix_prm_tokenizer
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        device = get_device_id()
+        micro_batch_size = int(prefix_config.get("prm_micro_batch_size", 1))
+        max_example_len = max(len(example["input_ids"]) for example in prm_examples)
+        print(
+            f"[prefix_correction][rank={self.rank}] scoring {len(prm_examples)} PRM examples "
+            f"micro_batch_size={micro_batch_size} max_len={max_example_len}",
+            flush=True,
+        )
+        all_scores = []
+        for start in range(0, len(prm_examples), micro_batch_size):
+            chunk = prm_examples[start:start + micro_batch_size]
+            max_len = max(len(example["input_ids"]) for example in chunk)
+            input_ids = torch.full((len(chunk), max_len), pad_token_id, dtype=torch.long, device=device)
+            attention_mask = torch.zeros((len(chunk), max_len), dtype=torch.long, device=device)
+            for row, example in enumerate(chunk):
+                ids = torch.tensor(example["input_ids"], dtype=torch.long, device=device)
+                input_ids[row, : ids.numel()] = ids
+                attention_mask[row, : ids.numel()] = 1
+
+            with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                model = self._prefix_prm_model
+                transformer_outputs = model.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                logits = model.v_head(transformer_outputs.last_hidden_state).squeeze(-1)
+                probs = torch.sigmoid(logits.float())
+
+            for row, example in enumerate(chunk):
+                flags = example["reward_flags"]
+                if flags:
+                    flag_tensor = torch.tensor(flags, dtype=torch.long, device=device)
+                    scores = probs[row].index_select(0, flag_tensor).detach().cpu().tolist()
+                else:
+                    scores = []
+                all_scores.append(scores)
+        return all_scores
+
+    def _get_prefix_value_running_stats(self):
+        if self._prefix_value_running_mean is None or self._prefix_value_running_sq_mean is None:
+            return None, None, 0
+        variance = max(0.0, self._prefix_value_running_sq_mean - self._prefix_value_running_mean ** 2)
+        return self._prefix_value_running_mean, variance ** 0.5, self._prefix_value_running_count
+
+    def _update_prefix_value_running_stats(self, values, momentum):
+        if not values:
+            return
+        values_tensor = torch.tensor(values, dtype=torch.float32)
+        batch_mean = float(values_tensor.mean().item())
+        batch_sq_mean = float((values_tensor * values_tensor).mean().item())
+        if self._prefix_value_running_mean is None or self._prefix_value_running_sq_mean is None:
+            self._prefix_value_running_mean = batch_mean
+            self._prefix_value_running_sq_mean = batch_sq_mean
+        else:
+            self._prefix_value_running_mean = (
+                momentum * self._prefix_value_running_mean + (1.0 - momentum) * batch_mean
+            )
+            self._prefix_value_running_sq_mean = (
+                momentum * self._prefix_value_running_sq_mean + (1.0 - momentum) * batch_sq_mean
+            )
+        self._prefix_value_running_count += len(values)
+
+    def _compute_prefix_correction_tensors(self, data: DataProto, prefix_config):
+        if not self._prefix_correction_is_enabled(prefix_config):
+            return {}
+
+        self._ensure_prefix_prm(prefix_config)
+        responses = data.batch["responses"]
+        response_mask = data.batch["response_mask"]
+        input_ids = data.batch["input_ids"]
+        attention_mask = data.batch["attention_mask"]
+        batch_size, response_length = responses.shape
+        device = responses.device
+
+        gate_tensor = torch.ones((batch_size, response_length), dtype=torch.float32, device=device)
+        delta_tensor = torch.zeros((batch_size, response_length), dtype=torch.float32, device=device)
+        value_tensor = torch.zeros((batch_size, response_length), dtype=torch.float32, device=device)
+        value_mask_tensor = torch.zeros((batch_size, response_length), dtype=torch.bool, device=device)
+        raw_gate_tensor = torch.ones((batch_size, response_length), dtype=torch.float32, device=device)
+        stats_ready_tensor = torch.zeros((batch_size, response_length), dtype=torch.bool, device=device)
+        std_floor_active_tensor = torch.zeros((batch_size, response_length), dtype=torch.bool, device=device)
+
+        delimiter = prefix_config.get("delimiter", chr(10) * 2)
+        n_prm_blocks = int(prefix_config.get("n_prm_blocks", 64))
+        step_token = prefix_config.get("prm_step_token", chr(10))
+        gate_mode = prefix_config.get("gate_mode", "ema")
+        ema_lambda = float(prefix_config.get("gate_ema_lambda", prefix_config.get("ema_lambda", 0.6)))
+        min_gate = float(prefix_config.get("min_gate", 0.05))
+        max_gate = float(prefix_config.get("max_gate", 1.5))
+        gate_alpha = float(prefix_config.get("gate_alpha", 0.25))
+        running_stats_momentum = float(prefix_config.get("running_stats_momentum", 0.95))
+        std_floor = float(prefix_config.get("std_floor", 0.05))
+        delta_clip_z = float(prefix_config.get("delta_clip_z", 2.0))
+        delta_clip = float(prefix_config.get("delta_clip", 0.5))
+        value_delta_coef = float(prefix_config.get("value_delta_coef", 0.1))
+        use_prm_gate = bool(prefix_config.get("use_prm_gate", True))
+        use_value_delta = bool(prefix_config.get("use_value_delta", True))
+        running_mean, running_std, running_count = self._get_prefix_value_running_stats()
+        stats_ready = running_mean is not None and running_std is not None and running_count > 0
+        denom = max(running_std if running_std is not None else 0.0, std_floor)
+        std_floor_active = stats_ready and running_std < std_floor
+
+        examples = []
+        sample_infos = []
+        prompt_width = input_ids.shape[-1] - response_length
+        for row in range(batch_size):
+            valid_len = int(response_mask[row].sum().item())
+            if valid_len <= 0:
+                sample_infos.append({"token_spans": []})
+                continue
+
+            response_token_ids = responses[row, :valid_len].detach().cpu().tolist()
+            response_text = self._decode_with_actor_tokenizer(response_token_ids)
+            segmentation = prefix_config.get("segmentation", "delimiter_grouped")
+
+            token_spans = []
+            block_texts = []
+            if segmentation == "delimiter_grouped":
+                grouped_blocks = self._split_delimiter_grouped_token_spans(
+                    response_token_ids,
+                    delimiter,
+                    n_prm_blocks,
+                )
+                for token_start, token_end, block_text in grouped_blocks:
+                    if token_end > token_start:
+                        token_spans.append((token_start, token_end))
+                        block_texts.append(block_text)
+            else:
+                grouped_blocks = self._split_delimiter_grouped(response_text, delimiter, n_prm_blocks)
+                prefix_lens = self._token_prefix_char_lens(response_token_ids, response_text)
+                for char_start, char_end, block_text in grouped_blocks:
+                    token_start, token_end = self._char_span_to_token_span(prefix_lens, char_start, char_end)
+                    if token_end > token_start:
+                        token_spans.append((token_start, token_end))
+                        block_texts.append(block_text)
+
+            if not token_spans:
+                token_spans = [(0, valid_len)]
+                block_texts = [response_text]
+
+            prompt_ids = input_ids[row, :prompt_width]
+            prompt_attn = attention_mask[row, :prompt_width].bool()
+            prompt_token_ids = prompt_ids[prompt_attn].detach().cpu().tolist()
+            prompt_text = self._decode_with_actor_tokenizer(prompt_token_ids)
+            prm_input_ids, reward_flags = self._build_prm_input(prompt_text, block_texts, step_token)
+            examples.append({"input_ids": prm_input_ids, "reward_flags": reward_flags})
+            sample_infos.append({"token_spans": token_spans})
+
+        scores_per_example = self._score_prm_examples(examples, prefix_config)
+        batch_values_for_stats = []
+        score_idx = 0
+        for row, info in enumerate(sample_infos):
+            token_spans = info["token_spans"]
+            if not token_spans:
+                continue
+            scores = scores_per_example[score_idx] if score_idx < len(scores_per_example) else []
+            score_idx += 1
+            if not scores:
+                continue
+            prev_gate = 1.0
+            prev_v = None
+            batch_values_for_stats.extend(float(score) for score in scores)
+            for block_idx, (token_start, token_end) in enumerate(token_spans):
+                v_i = float(scores[min(block_idx, len(scores) - 1)])
+                if gate_mode == "running_zscore":
+                    if stats_ready:
+                        z_i = (v_i - running_mean) / denom
+                        raw_gate_i = max(min_gate, min(max_gate, 1.0 + gate_alpha * z_i))
+                        gate_i = ema_lambda * prev_gate + (1.0 - ema_lambda) * raw_gate_i
+                        if prev_v is None:
+                            delta_i = 0.0
+                        else:
+                            delta_z_i = (v_i - prev_v) / denom
+                            delta_i = max(-delta_clip_z, min(delta_clip_z, delta_z_i))
+                    else:
+                        raw_gate_i = 1.0
+                        gate_i = 1.0
+                        delta_i = 0.0
+                else:
+                    raw_gate_i = v_i
+                    gate_i = max(min_gate, ema_lambda * prev_gate + (1.0 - ema_lambda) * v_i)
+                    if prev_v is None:
+                        delta_i = 0.0
+                    else:
+                        delta_i = max(-delta_clip, min(delta_clip, v_i - prev_v))
+                value_tensor[row, token_start:token_end] = v_i
+                value_mask_tensor[row, token_start:token_end] = True
+                raw_gate_tensor[row, token_start:token_end] = raw_gate_i
+                stats_ready_tensor[row, token_start:token_end] = stats_ready
+                std_floor_active_tensor[row, token_start:token_end] = std_floor_active
+                if use_prm_gate:
+                    gate_tensor[row, token_start:token_end] = gate_i
+                if use_value_delta:
+                    delta_tensor[row, token_start:token_end] = value_delta_coef * delta_i
+                prev_gate = gate_i
+                prev_v = v_i
+        self._update_prefix_value_running_stats(batch_values_for_stats, running_stats_momentum)
+
+        return {
+            "prefix_gate": gate_tensor,
+            "prefix_value_delta": delta_tensor,
+            "prefix_value": value_tensor,
+            "prefix_value_mask": value_mask_tensor,
+            "prefix_gate_raw": raw_gate_tensor,
+            "prefix_stats_ready": stats_ready_tensor,
+            "prefix_value_std_floor_active": std_floor_active_tensor,
+        }
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown")
     def compute_rm_score(self, data: DataProto, kl_estimator="k1"):
@@ -2572,12 +3064,17 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # Get global_steps from meta_info
         global_steps = data.meta_info.get("global_steps", -1)
         is_plot = data.meta_info.get("is_plot", False)
+        ratio_kl_switch_cfg = data.meta_info.get("ratio_kl_switch", None)
+        ratio_kl_switch_enabled = bool(ratio_kl_switch_cfg.get("enable", False)) if ratio_kl_switch_cfg is not None else False
         # Compute teacher entropy every step for logging, but only plot every 10 steps
         compute_entropy = True
 
         # Get response mask to identify valid (non-padded) response tokens
 
         response_mask = data.batch["response_mask"]  # shape: [batch, response_len]
+        prefix_tensors = self._compute_prefix_correction_tensors(
+            data, data.meta_info.get("prefix_correction", None)
+        )
 
         if self._do_switch_chat_template:
             if self.rank == 0:
@@ -2726,6 +3223,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             tensors = {}
             if rm_scores is not None:
                 tensors["rm_scores"] = rm_scores
+
+            if ratio_kl_switch_enabled:
+                tensors["teacher_response_log_probs"] = teacher_logp
             
             if teacher_on_student_logp is not None:
                 tensors["teacher_on_student_log_probs"] = teacher_on_student_logp
@@ -2745,6 +3245,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 tensors["overlap_mask"] = overlap_mask
             if teacher_in_student_mask is not None:
                 tensors["teacher_in_student_mask"] = teacher_in_student_mask
+            tensors.update(prefix_tensors)
 
             output = DataProto.from_dict(tensors=tensors)
 

@@ -33,16 +33,18 @@ Here is your task. Simply reply with either CORRECT, INCORRECT, or INVALID. Don'
 Judging the correctness of the candidate's answer:
 """
 
-NAME     = "Qwen3-4B-Non-Thinking-RL-Math" 
-EVAL_DIR = Path(f"justrl_eval_outputs/{NAME}")
+ROOT_DIR = Path(__file__).resolve().parents[3]
+NAME = "Qwen3-4B-Non-Thinking-RL-Math"
+EVAL_DIR = ROOT_DIR / "justrl_eval_outputs" / NAME
 OUTPUT_FILE = EVAL_DIR / "grading_results.json"
-MODEL_NAME = "../../model/CompassVerifier-3B"
+MODEL_NAME = str(ROOT_DIR / "model" / "CompassVerifier-3B")
+LENGTH_TOKENIZER_MODEL = str(ROOT_DIR / "model" / "Qwen3-1.7B")
 
 # Global variables to be initialized if needed
 vllm_model = None
 model_tokenizer = None
 sampling_params = None
-length_tokenizer = AutoTokenizer.from_pretrained("../../model/Qwen3-1.7B", local_files_only=True)
+length_tokenizer = None
 
 def get_len(seq):
     if length_tokenizer:
@@ -210,7 +212,26 @@ def grade_file(file_path, use_model_verifier=True):
 
 def main():
     parser = argparse.ArgumentParser(description="Grade evaluation results.")
-    # New argument to control the verifier
+    parser.add_argument(
+        "--eval-dir",
+        default=str(EVAL_DIR),
+        help="Directory containing jsonl generation files.",
+    )
+    parser.add_argument(
+        "--output-file",
+        default=None,
+        help="Path to write grading_results.json. Defaults to EVAL_DIR/grading_results.json.",
+    )
+    parser.add_argument(
+        "--verifier-model",
+        default=MODEL_NAME,
+        help="Verifier model path used when --enable_model_verifier is set.",
+    )
+    parser.add_argument(
+        "--length-tokenizer",
+        default=LENGTH_TOKENIZER_MODEL,
+        help="Tokenizer path used only for output length statistics.",
+    )
     parser.add_argument(
         "--enable_model_verifier", 
         action="store_true", 
@@ -218,15 +239,23 @@ def main():
     )
     args = parser.parse_args()
 
-    global vllm_model, model_tokenizer, sampling_params
+    eval_dir = Path(args.eval_dir)
+    output_file = Path(args.output_file) if args.output_file else eval_dir / "grading_results.json"
+
+    global vllm_model, model_tokenizer, sampling_params, length_tokenizer
+    try:
+        length_tokenizer = AutoTokenizer.from_pretrained(args.length_tokenizer, local_files_only=True)
+    except Exception as exc:
+        print(f"Warning: could not load length tokenizer {args.length_tokenizer}: {exc}")
+        length_tokenizer = None
     
     # Only load VLLM if we are enabling the verifier
     if args.enable_model_verifier:
         print("Loading CompassVerifier model...")
         from vllm import LLM, SamplingParams
-        model_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model_tokenizer = AutoTokenizer.from_pretrained(args.verifier_model)
         vllm_model = LLM(
-            model=MODEL_NAME,
+            model=args.verifier_model,
             tensor_parallel_size=8
         )
         sampling_params = SamplingParams(
@@ -237,21 +266,20 @@ def main():
         print("Model verifier disabled by default. Running in rule-based only mode.")
 
     all_results = []
-    if not EVAL_DIR.exists():
-        print(f"Directory {EVAL_DIR} does not exist.")
+    if not eval_dir.exists():
+        print(f"Directory {eval_dir} does not exist.")
         return
 
-    for file_path in EVAL_DIR.glob("*.jsonl"):
+    for file_path in eval_dir.glob("*.jsonl"):
         print(f"Processing file: {file_path}")
-        # Pass the flag to the grading function
         file_result = grade_file(file_path, use_model_verifier=args.enable_model_verifier)
         if file_result:
             all_results.append(file_result)
 
-    # Save results to JSON
-    with OUTPUT_FILE.open("w", encoding="utf-8") as f:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=4)
-    print(f"Grading results saved to {OUTPUT_FILE}")
+    print(f"Grading results saved to {output_file}")
 
 if __name__ == "__main__":
     main()
