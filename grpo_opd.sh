@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=url
-#SBATCH --output=logs/20251004/output_%j.log
-#SBATCH --error=logs/20251004/error_%j.log
+#SBATCH --job-name=grpo-opd
+#SBATCH --output=logs/20251004/grpo_opd_output_%j.log
+#SBATCH --error=logs/20251004/grpo_opd_error_%j.log
 #SBATCH --account=test
 #SBATCH --partition=TEST1
 #SBATCH --exclude=g[81-82]
@@ -14,13 +14,10 @@
 
 set -x
 
-# Configure logging when running outside SBATCH.
 if [ -z "$SLURM_JOB_ID" ]; then
-    # Create the log directory and file for local runs.
     LOG_DIR=${LOG_DIR:-logs}
     mkdir -p "$LOG_DIR"
-    LOG_FILE="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
-    # Mirror output to both terminal and log file.
+    LOG_FILE="${LOG_DIR}/grpo_opd_$(date +%Y%m%d_%H%M%S).log"
     exec > >(tee -a "$LOG_FILE") 2>&1
     echo "=========================================="
     echo "Log file: $LOG_FILE"
@@ -31,76 +28,97 @@ fi
 ray stop --force
 export RAY_memory_usage_threshold=0.99
 export CUDA_LAUNCH_BLOCKING=1
-# export CUDA_VISIBLE_DEVICES=1,2,3,4
 export PYTHONUNBUFFERED=1
-export PROJECT_NAME='OnPolicyDistillation' # TODO
+export PROJECT_NAME=${PROJECT_NAME:-OnPolicyDistillation}
 export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_TIMEOUT=7200
 export TORCH_DISTRIBUTED_DEBUG=INFO
-# export ADV_ESTIMATOR=token_reward_direct
-# export ADV_ESTIMATOR=token_reward_direct_plus_grpo
-# export ADV_ESTIMATOR=token_grpo
-export ADV_ESTIMATOR=grpo
-export GRPO_OUTCOME_WEIGHT=1.0
-# Swanlab setting used to continue exp  
-# export SWANLAB_RESUME=must
-# export SWANLAB_RUN_ID="jri5qia6iy67v7su0zjsv"
 
-
+export ADV_ESTIMATOR=token_reward_direct_grpo_gated_opd
 export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 export MAX_RESP_LENGTH=${MAX_RESP_LENGTH:-7168}
 export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-7168}
 export MAX_MODEL_LEN=$(( MAX_RESP_LENGTH + MAX_PROMPT_LENGTH > MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ? MAX_RESP_LENGTH + MAX_PROMPT_LENGTH : MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ))
-export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-64} # TODO: 1 / 8 / 16 / 32 / 64 (default 64)
-export TEMPERATURE=${TEMPERATURE:-1.0} # TODO: 0.6 / 0.8 / 1.0 / 1.2 (default 1.0)
-export TEACHER_TEMPERATURE=${TEACHER_TEMPERATURE:-1.0} # Teacher logits temperature (default 1.0, no scaling)
-export REPETITION_PENALTY=${REPETITION_PENALTY:-1.0} # TODO: 1.0 / 1.1 / 1.2 (default 1.0, no penalty)
+export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-64}
+export TEMPERATURE=${TEMPERATURE:-1.0}
+export TEACHER_TEMPERATURE=${TEACHER_TEMPERATURE:-1.0}
+export REPETITION_PENALTY=${REPETITION_PENALTY:-1.0}
 export N_RESPONSES=${N_RESPONSES:-4}
-export LOG_PROB_TOP_K=${LOG_PROB_TOP_K:-0} # 0 represents no top-k sampling
-export TOP_K_STRATEGY=${TOP_K_STRATEGY:-"only_stu"} # "only_stu" or "only_tch" or "intersection" or "union" or "union-intersection"
-export REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-"student_p"} # "student_p" or "teacher_p" or "none"
-# export LR=${LR:-1e-6}
-# export LR_SCHEDULER=${LR_SCHEDULER:-constant}
-export USE_KL=${USE_KL:-False} # TODO: True / False (default False)
-export ENABLE_FORMAT_REWARD=${ENABLE_FORMAT_REWARD:-False} # TODO: True / False (default False)
-export MODEL_DTYPE=${MODEL_DTYPE:-fp32} # actor/ref/critic fsdp_config.model_dtype: fp32 or bfloat16
-export IS_PLOT=${IS_PLOT:-True} # TODO: True / False (default False)
-export LOSS_AGG_MODE=${LOSS_AGG_MODE:-"token-mean"} # TODO: "token-mean" / "seq-mean-token-sum" / "seq-mean-token-mean" / "seq-mean-token-sum-norm" (default "token-mean")
+export LOG_PROB_TOP_K=${LOG_PROB_TOP_K:-16}
+export TOP_K_STRATEGY=${TOP_K_STRATEGY:-only_stu}
+export REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-student_p}
+export USE_KL=${USE_KL:-False}
+export ENABLE_FORMAT_REWARD=${ENABLE_FORMAT_REWARD:-False}
+export MODEL_DTYPE=${MODEL_DTYPE:-fp32}
+export IS_PLOT=${IS_PLOT:-True}
+export LOSS_AGG_MODE=${LOSS_AGG_MODE:-token-mean}
+export TRAIN_TOTAL_STEPS=${TRAIN_TOTAL_STEPS:-}
+export GRPO_OUTCOME_WEIGHT=${GRPO_OUTCOME_WEIGHT:-1.0}
 
-# TODO: qwen3_1p7b_base / qwen3_1p7b / llama31_8b_base / llama31_8b_inst / qwen3_8b_base / qwen3_8b / qwen25_1p5b_base / qwen25_1p5b_inst / qwen25_7b_base / qwen25_7b_inst / qwen25_math_7b_base / qwen25_math_7b_inst / qwen25_math_1p5b_base / qwen25_math_1p5b_inst / distill_r1_1p5b / olmo2_1124_7b_base / olmo2_1124_7b_sft / olmo2_1124_7b_inst / llama32_3b_inst
-# export EXPERIMENT_NAME=grpo_${TASK}_llama31_tulu3_8b_sft_8k-T_${TEMPERATURE}-n_${N_RESPONSES}-kl_${USE_KL}-mbs_${MINI_BATCH_SIZE}-${REWARD_TYPE}-$(date +%Y-%m-%d_%H-%M-%S)
+export GRPO_GATED_OPD_ENABLE=${GRPO_GATED_OPD_ENABLE:-True}
+export GRPO_GATED_OPD_GATE_MODE=${GRPO_GATED_OPD_GATE_MODE:-reward_positive}
+export GRPO_GATED_OPD_CORRECT_THRESHOLD=${GRPO_GATED_OPD_CORRECT_THRESHOLD:-0.5}
+export GRPO_GATED_OPD_OPD_COEF=${GRPO_GATED_OPD_OPD_COEF:-1.0}
+export GRPO_GATED_OPD_GRPO_COEF=${GRPO_GATED_OPD_GRPO_COEF:-1.0}
+
+if [ "$GRPO_GATED_OPD_ENABLE" != "True" ]; then
+    echo "GRPO_GATED_OPD_ENABLE must be True for grpo_opd.sh"
+    exit 2
+fi
+if [ "$LOG_PROB_TOP_K" -le 0 ]; then
+    echo "GRPO-Gated OPD requires LOG_PROB_TOP_K > 0"
+    exit 2
+fi
+if [ "$TOP_K_STRATEGY" != "only_stu" ]; then
+    echo "GRPO-Gated OPD requires TOP_K_STRATEGY=only_stu"
+    exit 2
+fi
+if [ "$N_RESPONSES" -le 1 ]; then
+    echo "GRPO-Gated OPD requires N_RESPONSES > 1"
+    exit 2
+fi
 
 export TRAIN_DATASET=${TRAIN_DATASET:-datasets/dapo-math-17k.parquet}
-export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-grpo}
-
-export TEST_DATA_DIR=datasets/test_data
-# TRAIN_DATASET=${TRAIN_FILE:-["$DATA_DIR/$TASK/train_${SAMPLE_SIZE}.parquet"]}
+export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-grpo-gated-opd}
+export TEST_DATA_DIR=${TEST_DATA_DIR:-datasets/test_data}
 TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME25/test.parquet", "$TEST_DATA_DIR/AMC23/test.parquet", "$TEST_DATA_DIR/AIME24/test.parquet"]}
-# TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME24/test.parquet"]}
-# TEST_DATASET=${TEST_FILE:-["$DATA_DIR/AIME24/test.parquet","$DATA_DIR/AIME25/test.parquet","$DATA_DIR/AMC23/test.parquet","$DATA_DIR/MATH-500/test.parquet","$DATA_DIR/Minerva/test.parquet","$DATA_DIR/Olympiad-Bench/test.parquet"]}
 
-# TODO:
 export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-model/DeepSeek-R1-Distill-Qwen-1.5B}
 export ACTOR_MODEL_NAME=$(basename "$ACTOR_MODEL_PATH")
 export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-model/JustRL-DeepSeek-1.5B}
 export REWARD_MODEL_NAME=$(basename "$REWARD_MODEL_PATH")
 
-export PROJECT_PATH=checkpoint
-export PARALLEL_SIZE=1
-export TRAIN_TAG=${TRAIN_TAG:-dapo17k}
+export PROJECT_PATH=${PROJECT_PATH:-checkpoint}
+export PARALLEL_SIZE=${PARALLEL_SIZE:-1}
+export TRAIN_TAG=${TRAIN_TAG:-gopd}
 RUN_STAMP=$(date +%Y-%m-%d_%H-%M-%S)
-export CKPT_PATH=${CKPT_PATH:-${PROJECT_PATH}/grpo_${TRAIN_TAG}_l${MAX_RESP_LENGTH}_n${N_RESPONSES}_mbs${MINI_BATCH_SIZE}_${RUN_STAMP}}
-export OUTLINES_CACHE_DIR=~/.cache/outlines/$(uuidgen)
+export CKPT_PATH=${PROJECT_PATH}/gopd_${TRAIN_TAG}_l${MAX_RESP_LENGTH}_n${N_RESPONSES}_mbs${MINI_BATCH_SIZE}_k${LOG_PROB_TOP_K}_${RUN_STAMP}
+echo "GRPO-OPD run config:"
+echo "  TRAIN_TAG=$TRAIN_TAG"
+echo "  TRAIN_DATASET=$TRAIN_DATASET"
+echo "  TRAIN_DATASET_NAME=$TRAIN_DATASET_NAME"
+echo "  ACTOR_MODEL_PATH=$ACTOR_MODEL_PATH"
+echo "  REWARD_MODEL_PATH=$REWARD_MODEL_PATH"
+echo "  MAX_RESP_LENGTH=$MAX_RESP_LENGTH"
+echo "  MAX_VAL_RESP_LENGTH=$MAX_VAL_RESP_LENGTH"
+echo "  TEMPERATURE=$TEMPERATURE"
+echo "  TEACHER_TEMPERATURE=$TEACHER_TEMPERATURE"
+echo "  N_RESPONSES=$N_RESPONSES"
+echo "  MINI_BATCH_SIZE=$MINI_BATCH_SIZE"
+echo "  LOG_PROB_TOP_K=$LOG_PROB_TOP_K"
+echo "  TOP_K_STRATEGY=$TOP_K_STRATEGY"
+echo "  GRPO_GATED_OPD_GATE_MODE=$GRPO_GATED_OPD_GATE_MODE"
+echo "  GRPO_GATED_OPD_CORRECT_THRESHOLD=$GRPO_GATED_OPD_CORRECT_THRESHOLD"
+echo "  GRPO_GATED_OPD_OPD_COEF=$GRPO_GATED_OPD_OPD_COEF"
+echo "  GRPO_GATED_OPD_GRPO_COEF=$GRPO_GATED_OPD_GRPO_COEF"
+echo "  CKPT_PATH=$CKPT_PATH"
+OUTLINES_UUID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
+export OUTLINES_CACHE_DIR=~/.cache/outlines/${OUTLINES_UUID}
 export NCCL_DEBUG=WARN
-
-# export VLLM_ATTENTION_BACKEND=XFORMERS
-# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=true
 export SWANLAB_LOG_DIR=${PROJECT_PATH}/swanlab_log
 export HYDRA_FULL_ERROR=1
-
-
-export EXPERIMENT_NAME=${EXPERIMENT_NAME:-$(basename "$CKPT_PATH")}
+export EXPERIMENT_NAME=$(basename "$CKPT_PATH")
 
 KL_ARGS=""
 if [ "$USE_KL" = "True" ]; then
@@ -112,22 +130,32 @@ else
 fi
 
 LR_ARGS=""
-if [ "$LR_SCHEDULER" = "cosine" ]; then
+if [ "${LR_SCHEDULER:-}" = "cosine" ]; then
     LR_ARGS="actor_rollout_ref.actor.optim.warmup_style=cosine \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03"
 fi
 
+TRAIN_TOTAL_STEPS_ARGS=""
+if [ -n "$TRAIN_TOTAL_STEPS" ]; then
+    TRAIN_TOTAL_STEPS_ARGS="trainer.total_training_steps=$TRAIN_TOTAL_STEPS"
+fi
+
+GRPO_GATED_OPD_ARGS="+algorithm.grpo_gated_opd.enable=$GRPO_GATED_OPD_ENABLE \
++algorithm.grpo_gated_opd.gate_mode=$GRPO_GATED_OPD_GATE_MODE \
++algorithm.grpo_gated_opd.correct_threshold=$GRPO_GATED_OPD_CORRECT_THRESHOLD \
++algorithm.grpo_gated_opd.opd_coef=$GRPO_GATED_OPD_OPD_COEF \
++algorithm.grpo_gated_opd.grpo_coef=$GRPO_GATED_OPD_GRPO_COEF"
+
 PPO_MAX_TOKEN_LEN_PER_GPU=$(( ((1024 + MAX_RESP_LENGTH) > 32768) ? (1024 + MAX_RESP_LENGTH) : 32768))
 echo "PPO_MAX_TOKEN_LEN_PER_GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
-
 
 ray start --head
 sleep 5
 
-
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$ADV_ESTIMATOR \
     algorithm.grpo_outcome_weight=$GRPO_OUTCOME_WEIGHT \
+    $GRPO_GATED_OPD_ARGS \
     data.shuffle=False \
     data.train_files="$TRAIN_DATASET" \
     data.val_files="$TEST_DATASET" \
@@ -135,7 +163,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=$MAX_PROMPT_LENGTH \
     data.max_response_length=$MAX_RESP_LENGTH \
     data.filter_overlong_prompts=True \
-    data.truncation='error' \
+    data.truncation=error \
     data.return_raw_chat=True \
     actor_rollout_ref.model.path=$ACTOR_MODEL_PATH \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -177,7 +205,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.repetition_penalty=$REPETITION_PENALTY \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    reward_model.enable=False \
+    reward_model.enable=True \
     +reward_model.reward_kwargs.enable_format_reward=$ENABLE_FORMAT_REWARD \
     reward_model.model.path=$REWARD_MODEL_PATH \
     reward_model.model.input_tokenizer=null \
@@ -198,12 +226,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
+    $TRAIN_TOTAL_STEPS_ARGS \
     trainer.default_local_dir="$CKPT_PATH" \
     trainer.is_plot=$IS_PLOT
+MAIN_STATUS=$?
 
-# Log the end time for local runs.
 if [ -z "$SLURM_JOB_ID" ]; then
     echo "=========================================="
     echo "End time: $(date)"
     echo "=========================================="
 fi
+exit $MAIN_STATUS

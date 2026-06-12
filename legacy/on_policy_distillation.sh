@@ -28,7 +28,9 @@ if [ -z "$SLURM_JOB_ID" ]; then
     echo "=========================================="
 fi
 
-ray stop --force
+if [ "${SKIP_RAY_STOP:-False}" != "True" ]; then
+    ray stop --force || true
+fi
 export RAY_memory_usage_threshold=0.99
 export CUDA_LAUNCH_BLOCKING=1
 # export CUDA_VISIBLE_DEVICES=1,2,3,4
@@ -49,9 +51,9 @@ export GRPO_OUTCOME_WEIGHT=1.0
 
 
 # DeepMath-103K
-export MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-export MAX_RESP_LENGTH=${MAX_RESP_LENGTH:-7168}  # TODO: 31744 /15360 / 7168 / 3072 / 5120
-export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-7168} # TODO: 15360 / 7168 / 3072
+export MAX_PROMPT_LENGTH=1024
+export MAX_RESP_LENGTH=${MAX_RESP_LENGTH:-7168}
+export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-$MAX_RESP_LENGTH}
 export MAX_MODEL_LEN=$(( MAX_RESP_LENGTH + MAX_PROMPT_LENGTH > MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ? MAX_RESP_LENGTH + MAX_PROMPT_LENGTH : MAX_VAL_RESP_LENGTH + MAX_PROMPT_LENGTH ))
 export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-64} # TODO: 1 / 8 / 16 / 32 / 64 (default 64)
 export TEMPERATURE=${TEMPERATURE:-1.0} # TODO: 0.6 / 0.8 / 1.0 / 1.2 (default 1.0)
@@ -61,24 +63,20 @@ export N_RESPONSES=${N_RESPONSES:-4} # TODO: 4 / 8 / 16 / 32 (default: 4)
 export LOG_PROB_TOP_K=${LOG_PROB_TOP_K:-16} # 0 represents no top-k sampling
 export TOP_K_STRATEGY=${TOP_K_STRATEGY:-"only_stu"} # "only_stu" or "only_tch" or "intersection" or "union" or "union-intersection"
 export REWARD_WEIGHT_MODE=${REWARD_WEIGHT_MODE:-"student_p"} # "student_p" or "teacher_p" or "none"
+export ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.8}
+export TRAINER_N_GPUS_PER_NODE=${TRAINER_N_GPUS_PER_NODE:-8}
+export PREFIX_CORRECTION_ENABLE=${PREFIX_CORRECTION_ENABLE:-False}
+export OUTCOME_OPD_MASK_ENABLE=${OUTCOME_OPD_MASK_ENABLE:-False}
+export RATIO_KL_SWITCH_ENABLE=${RATIO_KL_SWITCH_ENABLE:-False}
+export ORACLE_RA_OPD_ENABLE=${ORACLE_RA_OPD_ENABLE:-False}
 # export LR=${LR:-1e-6}
 # export LR_SCHEDULER=${LR_SCHEDULER:-constant}
 export USE_KL=${USE_KL:-False} # TODO: True / False (default False)
 export ENABLE_FORMAT_REWARD=${ENABLE_FORMAT_REWARD:-False} # TODO: True / False (default False)
 export MODEL_DTYPE=${MODEL_DTYPE:-fp32} # actor/ref/critic fsdp_config.model_dtype: fp32 or bfloat16
-export IS_PLOT=${IS_PLOT:-True} # TODO: True / False (default False)
+export IS_PLOT=${IS_PLOT:-False} # TODO: True / False (default False)
 export LOSS_AGG_MODE=${LOSS_AGG_MODE:-"token-mean"} # TODO: "token-mean" / "seq-mean-token-sum" / "seq-mean-token-mean" / "seq-mean-token-sum-norm" (default "token-mean")
-export TRAIN_TOTAL_STEPS=${TRAIN_TOTAL_STEPS:-}
-export RESUME_MODE=${RESUME_MODE:-auto}
-export RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
-export OVERLAP_ROUTE_OPD_ENABLE=${OVERLAP_ROUTE_OPD_ENABLE:-False}
-export OVERLAP_ROUTE_MODE=${OVERLAP_ROUTE_MODE:-prune_opd}
-export OVERLAP_ROUTE_TAU=${OVERLAP_ROUTE_TAU:-0.7}
-export OVERLAP_ROUTE_TOP_K=${OVERLAP_ROUTE_TOP_K:-$LOG_PROB_TOP_K}
-export OVERLAP_ROUTE_TRIGGER=${OVERLAP_ROUTE_TRIGGER:-first_low}
-export OVERLAP_ROUTE_WDROP=${OVERLAP_ROUTE_WDROP:-0.01}
-export OVERLAP_ROUTE_WBASE=${OVERLAP_ROUTE_WBASE:-0.5}
-export OVERLAP_ROUTE_FKL_COEF=${OVERLAP_ROUTE_FKL_COEF:-0.1}
+export TRAIN_TOTAL_STEPS=${TRAIN_TOTAL_STEPS:-null}
 
 # TODO: qwen3_1p7b_base / qwen3_1p7b / llama31_8b_base / llama31_8b_inst / qwen3_8b_base / qwen3_8b / qwen25_1p5b_base / qwen25_1p5b_inst / qwen25_7b_base / qwen25_7b_inst / qwen25_math_7b_base / qwen25_math_7b_inst / qwen25_math_1p5b_base / qwen25_math_1p5b_inst / distill_r1_1p5b / olmo2_1124_7b_base / olmo2_1124_7b_sft / olmo2_1124_7b_inst / llama32_3b_inst
 # export EXPERIMENT_NAME=grpo_${TASK}_llama31_tulu3_8b_sft_8k-T_${TEMPERATURE}-n_${N_RESPONSES}-kl_${USE_KL}-mbs_${MINI_BATCH_SIZE}-${REWARD_TYPE}-$(date +%Y-%m-%d_%H-%M-%S)
@@ -87,14 +85,14 @@ export OVERLAP_ROUTE_FKL_COEF=${OVERLAP_ROUTE_FKL_COEF:-0.1}
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/OpenThoughts3_opd.parquet
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/sampled_complement_30k.parquet
 # export TRAIN_DATASET=datasets/DeepMath-103K/verl_format/train_filtered_sampled.parquet
-export TRAIN_DATASET=${TRAIN_DATASET:-datasets/dapo-math-17k.parquet}
+export TRAIN_DATASET=${TRAIN_DATASET:-datasets/dapo-math-17k_2k.parquet}
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/data/math-00000-of-00001.parquet
 # export TRAIN_DATASET=datasets/Skywork-OR1-RL-Data/filtered/math-1p5b-filtered-diff-max8.parquet
 # export TRAIN_DATASET=datasets/DAPO-Math-17k-Processed/DAPO-Math.parquet
 # export TRAIN_DATASET=datasets/skywork/train_7b_math.parquet
 # export TRAIN_DATASET=datasets/DAPO-Math-17k-Processed/DAPO-Math_part2.parquet
 # export TRAIN_DATASET=datasets/OpenThoughts3-1.2M/verl_format/train.parquet
-export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k}
+export TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-2k}
 # export TRAIN_DATASET_NAME=POLARIS-4B-S1
 # export TRAIN_DATASET_NAME=Skywork-OR1-RL-Data
 # export TRAIN_DATASET_NAME=DAPO-Math-17k-1percent
@@ -143,22 +141,147 @@ export REWARD_MODEL_NAME=$(basename "$REWARD_MODEL_PATH")
 
 export PROJECT_PATH=checkpoint
 export PARALLEL_SIZE=1
-OVERLAP_ROUTE_SUFFIX=""
-if [ "$OVERLAP_ROUTE_OPD_ENABLE" = "True" ]; then
-    if [ "$OVERLAP_ROUTE_MODE" = "prune_opd" ]; then
-        OVERLAP_ROUTE_SUFFIX="-overlap_prune_opd_tau_${OVERLAP_ROUTE_TAU}_wdrop_${OVERLAP_ROUTE_WDROP}_wbase_${OVERLAP_ROUTE_WBASE}"
-    elif [ "$OVERLAP_ROUTE_MODE" = "prune_opd_event_fkl" ]; then
-        OVERLAP_ROUTE_SUFFIX="-overlap_prune_opd_event_fkl_tau_${OVERLAP_ROUTE_TAU}_wdrop_${OVERLAP_ROUTE_WDROP}_wbase_${OVERLAP_ROUTE_WBASE}_fkl_${OVERLAP_ROUTE_FKL_COEF}"
-    elif [ "$OVERLAP_ROUTE_MODE" = "union_rkl_teacher_fkl_switch" ]; then
-        OVERLAP_ROUTE_SUFFIX="-union_rkl_teacher_fkl_switch_tau_${OVERLAP_ROUTE_TAU}_fkl_${OVERLAP_ROUTE_FKL_COEF}"
-    else
-        OVERLAP_ROUTE_SUFFIX="-overlap_${OVERLAP_ROUTE_MODE}_tau_${OVERLAP_ROUTE_TAU}"
-    fi
+
+PREFIX_CORRECTION_SUFFIX=""
+PREFIX_CORRECTION_ARGS=""
+if [ "$PREFIX_CORRECTION_ENABLE" = "True" ]; then
+    export PRM_MODEL_PATH=${PRM_MODEL_PATH:-model/Skywork-o1-Open-PRM-Qwen-2.5-1.5B}
+    export PREFIX_CORRECTION_SEGMENTATION=${PREFIX_CORRECTION_SEGMENTATION:-delimiter_grouped}
+    export N_PRM_BLOCKS=${N_PRM_BLOCKS:-64}
+    export INCLUDE_SAMPLED_TOKEN=${INCLUDE_SAMPLED_TOKEN:-False}
+    export USE_PRM_GATE=${USE_PRM_GATE:-True}
+    export USE_VALUE_DELTA=${USE_VALUE_DELTA:-True}
+    export PREFIX_GATE_MODE=${PREFIX_GATE_MODE:-running_zscore}
+    export PREFIX_EMA_LAMBDA=${PREFIX_EMA_LAMBDA:-0.6}
+    export PREFIX_GATE_ALPHA=${PREFIX_GATE_ALPHA:-0.25}
+    export PREFIX_MIN_GATE=${PREFIX_MIN_GATE:-0.5}
+    export PREFIX_MAX_GATE=${PREFIX_MAX_GATE:-1.5}
+    export PREFIX_RUNNING_STATS_MOMENTUM=${PREFIX_RUNNING_STATS_MOMENTUM:-0.95}
+    export PREFIX_STD_FLOOR=${PREFIX_STD_FLOOR:-0.05}
+    export VALUE_DELTA_COEF=${VALUE_DELTA_COEF:-0.1}
+    export PREFIX_DELTA_CLIP=${PREFIX_DELTA_CLIP:-0.5}
+    export PREFIX_DELTA_CLIP_Z=${PREFIX_DELTA_CLIP_Z:-2.0}
+    export PRM_MICRO_BATCH_SIZE=${PRM_MICRO_BATCH_SIZE:-1}
+    export PRM_DTYPE=${PRM_DTYPE:-bf16}
+    PREFIX_CORRECTION_SUFFIX="-rgopd_v2_prm_${N_PRM_BLOCKS}-sampled_${INCLUDE_SAMPLED_TOKEN}-gate_${USE_PRM_GATE}-${PREFIX_GATE_MODE}-delta_${USE_VALUE_DELTA}"
+    PREFIX_CORRECTION_ARGS="+algorithm.prefix_correction.enable=True \
+    +algorithm.prefix_correction.prm_model_path=$PRM_MODEL_PATH \
+    +algorithm.prefix_correction.segmentation=$PREFIX_CORRECTION_SEGMENTATION \
+    +algorithm.prefix_correction.n_prm_blocks=$N_PRM_BLOCKS \
+    +algorithm.prefix_correction.include_sampled_token=$INCLUDE_SAMPLED_TOKEN \
+    +algorithm.prefix_correction.use_prm_gate=$USE_PRM_GATE \
+    +algorithm.prefix_correction.use_value_delta=$USE_VALUE_DELTA \
+    +algorithm.prefix_correction.gate_mode=$PREFIX_GATE_MODE \
+    +algorithm.prefix_correction.ema_lambda=$PREFIX_EMA_LAMBDA \
+    +algorithm.prefix_correction.gate_ema_lambda=$PREFIX_EMA_LAMBDA \
+    +algorithm.prefix_correction.gate_alpha=$PREFIX_GATE_ALPHA \
+    +algorithm.prefix_correction.min_gate=$PREFIX_MIN_GATE \
+    +algorithm.prefix_correction.max_gate=$PREFIX_MAX_GATE \
+    +algorithm.prefix_correction.running_stats_momentum=$PREFIX_RUNNING_STATS_MOMENTUM \
+    +algorithm.prefix_correction.std_floor=$PREFIX_STD_FLOOR \
+    +algorithm.prefix_correction.value_delta_coef=$VALUE_DELTA_COEF \
+    +algorithm.prefix_correction.delta_clip=$PREFIX_DELTA_CLIP \
+    +algorithm.prefix_correction.delta_clip_z=$PREFIX_DELTA_CLIP_Z \
+    +algorithm.prefix_correction.prm_micro_batch_size=$PRM_MICRO_BATCH_SIZE \
+    +algorithm.prefix_correction.prm_dtype=$PRM_DTYPE"
 fi
-RUN_STAMP=$(date +%Y-%m-%d_%H-%M-%S)
-DEFAULT_EXPERIMENT_NAME=${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${OVERLAP_ROUTE_SUFFIX}-${RUN_STAMP}
-export EXPERIMENT_NAME=${EXPERIMENT_NAME:-$DEFAULT_EXPERIMENT_NAME}
-export CKPT_PATH=${CKPT_PATH:-${PROJECT_PATH}/${EXPERIMENT_NAME}}
+
+OUTCOME_OPD_MASK_SUFFIX=""
+OUTCOME_OPD_MASK_ARGS=""
+if [ "$OUTCOME_OPD_MASK_ENABLE" = "True" ]; then
+    export OUTCOME_OPD_CORRECT_THRESHOLD=${OUTCOME_OPD_CORRECT_THRESHOLD:-0.5}
+    export OUTCOME_OPD_WRONG_PREFIX_RATIO=${OUTCOME_OPD_WRONG_PREFIX_RATIO:-0.25}
+    export OUTCOME_OPD_MIN_PREFIX_TOKENS=${OUTCOME_OPD_MIN_PREFIX_TOKENS:-1}
+    OUTCOME_OPD_MASK_SUFFIX="-outcome_opd_wrong${OUTCOME_OPD_WRONG_PREFIX_RATIO}"
+    OUTCOME_OPD_MASK_ARGS="+algorithm.outcome_opd_mask.enable=True \
+    +algorithm.outcome_opd_mask.correct_threshold=$OUTCOME_OPD_CORRECT_THRESHOLD \
+    +algorithm.outcome_opd_mask.wrong_prefix_ratio=$OUTCOME_OPD_WRONG_PREFIX_RATIO \
+    +algorithm.outcome_opd_mask.min_prefix_tokens=$OUTCOME_OPD_MIN_PREFIX_TOKENS"
+fi
+
+RATIO_KL_SWITCH_SUFFIX=""
+RATIO_KL_SWITCH_ARGS=""
+if [ "$RATIO_KL_SWITCH_ENABLE" = "True" ]; then
+    export RATIO_KL_SWITCH_OBJECTIVE=${RATIO_KL_SWITCH_OBJECTIVE:-rkl_fkl}
+    export RATIO_KL_SWITCH_SAMPLE_DISTRIBUTION=${RATIO_KL_SWITCH_SAMPLE_DISTRIBUTION:-bernoulli}
+    export RATIO_KL_SWITCH_TOP_K=${RATIO_KL_SWITCH_TOP_K:-16}
+    export RATIO_KL_SWITCH_CANDIDATE_SOURCE=${RATIO_KL_SWITCH_CANDIDATE_SOURCE:-student_topk}
+    export RATIO_KL_SWITCH_LOG_RATIO_CLIP_MIN=${RATIO_KL_SWITCH_LOG_RATIO_CLIP_MIN:--80.0}
+    export RATIO_KL_SWITCH_Q_POWER=${RATIO_KL_SWITCH_Q_POWER:-1.0}
+    if [ "$RATIO_KL_SWITCH_OBJECTIVE" = "jsd" ]; then
+        RATIO_KL_SWITCH_SUFFIX="-topk_jsd"
+    elif [ "$RATIO_KL_SWITCH_SAMPLE_DISTRIBUTION" = "soft" ]; then
+        RATIO_KL_SWITCH_SUFFIX="-tropd_softmix_topk_rkl_fkl"
+    else
+        RATIO_KL_SWITCH_SUFFIX="-tropd_sampled_gate_topk_rkl_fkl"
+    fi
+    RATIO_KL_SWITCH_ARGS="+algorithm.ratio_kl_switch.enable=True \
+    +algorithm.ratio_kl_switch.objective=$RATIO_KL_SWITCH_OBJECTIVE \
+    +algorithm.ratio_kl_switch.sample_distribution=$RATIO_KL_SWITCH_SAMPLE_DISTRIBUTION \
+    +algorithm.ratio_kl_switch.top_k=$RATIO_KL_SWITCH_TOP_K \
+    +algorithm.ratio_kl_switch.candidate_source=$RATIO_KL_SWITCH_CANDIDATE_SOURCE \
+    +algorithm.ratio_kl_switch.log_ratio_clip_min=$RATIO_KL_SWITCH_LOG_RATIO_CLIP_MIN \
+    +algorithm.ratio_kl_switch.q_power=$RATIO_KL_SWITCH_Q_POWER"
+fi
+
+ORACLE_RA_OPD_SUFFIX=""
+ORACLE_RA_OPD_ARGS=""
+if [ "$ORACLE_RA_OPD_ENABLE" = "True" ]; then
+    if [ "$PREFIX_CORRECTION_ENABLE" = "True" ] || [ "$OUTCOME_OPD_MASK_ENABLE" = "True" ] || [ "$RATIO_KL_SWITCH_ENABLE" = "True" ]; then
+        echo "ORACLE_RA_OPD_ENABLE=True should not be combined with PREFIX_CORRECTION_ENABLE, OUTCOME_OPD_MASK_ENABLE, or RATIO_KL_SWITCH_ENABLE" >&2
+        exit 1
+    fi
+    export ORACLE_RA_TEACHER_MODEL_PATH=${ORACLE_RA_TEACHER_MODEL_PATH:-model/JustRL-DeepSeek-1.5B}
+    export ORACLE_RA_PREFIX_FRACS=${ORACLE_RA_PREFIX_FRACS:-0.0,0.25,0.75}
+    export ORACLE_RA_NUM_CONTINUATIONS=${ORACLE_RA_NUM_CONTINUATIONS:-8}
+    export ORACLE_RA_EPSILON=${ORACLE_RA_EPSILON:-1e-6}
+    export ORACLE_RA_GATE_SCORE_MODE=${ORACLE_RA_GATE_SCORE_MODE:-relative}
+    export ORACLE_RA_GATE_TRANSFORM=${ORACLE_RA_GATE_TRANSFORM:-clip}
+    export ORACLE_RA_MIN_GATE=${ORACLE_RA_MIN_GATE:-0.0}
+    export ORACLE_RA_TEMPERATURE=${ORACLE_RA_TEMPERATURE:-0.7}
+    export ORACLE_RA_TOP_P=${ORACLE_RA_TOP_P:-0.95}
+    export ORACLE_RA_MAX_TOKENS_MODE=${ORACLE_RA_MAX_TOKENS_MODE:-train_response_length}
+    export ORACLE_RA_MAX_NEW_TOKENS_CAP=${ORACLE_RA_MAX_NEW_TOKENS_CAP:-null}
+    export ORACLE_RA_GENERATION_BATCH_SIZE=${ORACLE_RA_GENERATION_BATCH_SIZE:-1}
+    export ORACLE_RA_GPU_MEMORY_UTILIZATION=${ORACLE_RA_GPU_MEMORY_UTILIZATION:-0.80}
+    export ORACLE_RA_TEACHER_NUM_ACTORS=${ORACLE_RA_TEACHER_NUM_ACTORS:-2}
+    export ORACLE_RA_TEACHER_GPUS_PER_ACTOR=${ORACLE_RA_TEACHER_GPUS_PER_ACTOR:-1}
+    export ORACLE_RA_TENSOR_PARALLEL_SIZE=${ORACLE_RA_TENSOR_PARALLEL_SIZE:-1}
+    export ORACLE_RA_DISPATCH_POLICY=${ORACLE_RA_DISPATCH_POLICY:-length_bucket_round_robin}
+    export ORACLE_RA_ENFORCE_EAGER=${ORACLE_RA_ENFORCE_EAGER:-True}
+    ORACLE_RA_TOTAL_TEACHER_GPUS=$((ORACLE_RA_TEACHER_NUM_ACTORS * ORACLE_RA_TEACHER_GPUS_PER_ACTOR))
+    if [ "$ORACLE_RA_TOTAL_TEACHER_GPUS" -le 0 ]; then
+        echo "Oracle RA requires ORACLE_RA_TEACHER_NUM_ACTORS * ORACLE_RA_TEACHER_GPUS_PER_ACTOR > 0" >&2
+        exit 1
+    fi
+    if [ "$ORACLE_RA_TENSOR_PARALLEL_SIZE" -gt "$ORACLE_RA_TEACHER_GPUS_PER_ACTOR" ]; then
+        echo "Oracle RA requires ORACLE_RA_TENSOR_PARALLEL_SIZE <= ORACLE_RA_TEACHER_GPUS_PER_ACTOR" >&2
+        exit 1
+    fi
+    ORACLE_RA_OPD_SUFFIX="-oracle_ra_prefix_recoverability"
+    ORACLE_RA_OPD_ARGS="+algorithm.oracle_ra_opd.enable=True \
+    +algorithm.oracle_ra_opd.teacher_model_path=$ORACLE_RA_TEACHER_MODEL_PATH \
+    +algorithm.oracle_ra_opd.prefix_fracs=[$ORACLE_RA_PREFIX_FRACS] \
+    +algorithm.oracle_ra_opd.num_continuations=$ORACLE_RA_NUM_CONTINUATIONS \
+    +algorithm.oracle_ra_opd.epsilon=$ORACLE_RA_EPSILON \
+    +algorithm.oracle_ra_opd.gate_score_mode=$ORACLE_RA_GATE_SCORE_MODE \
+    +algorithm.oracle_ra_opd.gate_transform=$ORACLE_RA_GATE_TRANSFORM \
+    +algorithm.oracle_ra_opd.min_gate=$ORACLE_RA_MIN_GATE \
+    +algorithm.oracle_ra_opd.temperature=$ORACLE_RA_TEMPERATURE \
+    +algorithm.oracle_ra_opd.top_p=$ORACLE_RA_TOP_P \
+    +algorithm.oracle_ra_opd.max_tokens_mode=$ORACLE_RA_MAX_TOKENS_MODE \
+    +algorithm.oracle_ra_opd.max_new_tokens_cap=$ORACLE_RA_MAX_NEW_TOKENS_CAP \
+    +algorithm.oracle_ra_opd.generation_batch_size=$ORACLE_RA_GENERATION_BATCH_SIZE \
+    +algorithm.oracle_ra_opd.gpu_memory_utilization=$ORACLE_RA_GPU_MEMORY_UTILIZATION \
+    +algorithm.oracle_ra_opd.teacher_num_actors=$ORACLE_RA_TEACHER_NUM_ACTORS \
+    +algorithm.oracle_ra_opd.teacher_gpus_per_actor=$ORACLE_RA_TEACHER_GPUS_PER_ACTOR \
+    +algorithm.oracle_ra_opd.tensor_parallel_size=$ORACLE_RA_TENSOR_PARALLEL_SIZE \
+    +algorithm.oracle_ra_opd.dispatch_policy=$ORACLE_RA_DISPATCH_POLICY \
+    +algorithm.oracle_ra_opd.enforce_eager=$ORACLE_RA_ENFORCE_EAGER \
+    +algorithm.oracle_ra_opd.max_model_len=$MAX_MODEL_LEN"
+fi
+
+export CKPT_PATH=${PROJECT_PATH}/${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${PREFIX_CORRECTION_SUFFIX}${OUTCOME_OPD_MASK_SUFFIX}${RATIO_KL_SWITCH_SUFFIX}${ORACLE_RA_OPD_SUFFIX}-$(date +%Y-%m-%d_%H-%M-%S)
 OUTLINES_UUID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
 export OUTLINES_CACHE_DIR=~/.cache/outlines/${OUTLINES_UUID}
 export NCCL_DEBUG=WARN
@@ -170,24 +293,8 @@ export SWANLAB_LOG_DIR=${PROJECT_PATH}/swanlab_log
 export HYDRA_FULL_ERROR=1
 
 
-echo "Run config:"
-echo "  TRAIN_DATASET=$TRAIN_DATASET"
-echo "  TRAIN_DATASET_NAME=$TRAIN_DATASET_NAME"
-echo "  ACTOR_MODEL_PATH=$ACTOR_MODEL_PATH"
-echo "  REWARD_MODEL_PATH=$REWARD_MODEL_PATH"
-echo "  MAX_RESP_LENGTH=$MAX_RESP_LENGTH"
-echo "  MAX_VAL_RESP_LENGTH=$MAX_VAL_RESP_LENGTH"
-echo "  TEMPERATURE=$TEMPERATURE"
-echo "  TEACHER_TEMPERATURE=$TEACHER_TEMPERATURE"
-echo "  N_RESPONSES=$N_RESPONSES"
-echo "  MINI_BATCH_SIZE=$MINI_BATCH_SIZE"
-echo "  TOP_K_STRATEGY=$TOP_K_STRATEGY"
-echo "  OVERLAP_ROUTE_OPD_ENABLE=$OVERLAP_ROUTE_OPD_ENABLE"
-echo "  OVERLAP_ROUTE_MODE=$OVERLAP_ROUTE_MODE"
-echo "  CKPT_PATH=$CKPT_PATH"
-echo "  EXPERIMENT_NAME=$EXPERIMENT_NAME"
-echo "  RESUME_MODE=$RESUME_MODE"
-echo "  RESUME_FROM_PATH=$RESUME_FROM_PATH"
+export EXPERIMENT_NAME=${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}${PREFIX_CORRECTION_SUFFIX}${OUTCOME_OPD_MASK_SUFFIX}${RATIO_KL_SWITCH_SUFFIX}${ORACLE_RA_OPD_SUFFIX}-$(date +%Y-%m-%d_%H-%M-%S)
+
 
 KL_ARGS=""
 if [ "$USE_KL" = "True" ]; then
@@ -204,40 +311,23 @@ if [ "$LR_SCHEDULER" = "cosine" ]; then
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03"
 fi
 
-TRAIN_TOTAL_STEPS_ARGS=""
-if [ -n "$TRAIN_TOTAL_STEPS" ]; then
-    TRAIN_TOTAL_STEPS_ARGS="trainer.total_training_steps=$TRAIN_TOTAL_STEPS"
-fi
-
-RESUME_ARGS="trainer.resume_mode=$RESUME_MODE"
-if [ -n "$RESUME_FROM_PATH" ]; then
-    RESUME_ARGS="$RESUME_ARGS trainer.resume_from_path=$RESUME_FROM_PATH"
-fi
-
-OVERLAP_ROUTE_ARGS=""
-if [ "$OVERLAP_ROUTE_OPD_ENABLE" = "True" ]; then
-    OVERLAP_ROUTE_ARGS="+algorithm.overlap_route_opd.enable=True \
-    +algorithm.overlap_route_opd.mode=$OVERLAP_ROUTE_MODE \
-    +algorithm.overlap_route_opd.tau=$OVERLAP_ROUTE_TAU \
-    +algorithm.overlap_route_opd.top_k=$OVERLAP_ROUTE_TOP_K \
-    +algorithm.overlap_route_opd.trigger=$OVERLAP_ROUTE_TRIGGER \
-    +algorithm.overlap_route_opd.wdrop=$OVERLAP_ROUTE_WDROP \
-    +algorithm.overlap_route_opd.wbase=$OVERLAP_ROUTE_WBASE \
-    +algorithm.overlap_route_opd.fkl_coef=$OVERLAP_ROUTE_FKL_COEF"
-fi
-
 PPO_MAX_TOKEN_LEN_PER_GPU=$(( ((1024 + MAX_RESP_LENGTH) > 32768) ? (1024 + MAX_RESP_LENGTH) : 32768))
 echo "PPO_MAX_TOKEN_LEN_PER_GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
 
 
-ray start --head
-sleep 5
+if [ "${SKIP_RAY_START:-False}" != "True" ]; then
+    ray start --head
+    sleep 5
+fi
 
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$ADV_ESTIMATOR \
     algorithm.grpo_outcome_weight=$GRPO_OUTCOME_WEIGHT \
-    $OVERLAP_ROUTE_ARGS \
+    $PREFIX_CORRECTION_ARGS \
+    $OUTCOME_OPD_MASK_ARGS \
+    $RATIO_KL_SWITCH_ARGS \
+    $ORACLE_RA_OPD_ARGS \
     data.shuffle=False \
     data.train_files="$TRAIN_DATASET" \
     data.val_files="$TEST_DATASET" \
@@ -276,7 +366,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.reward_weight_mode=$REWARD_WEIGHT_MODE \
     +actor_rollout_ref.rollout.teacher_temperature=$TEACHER_TEMPERATURE \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$PARALLEL_SIZE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEMORY_UTILIZATION \
     actor_rollout_ref.rollout.max_model_len=$MAX_MODEL_LEN \
     actor_rollout_ref.rollout.n=$N_RESPONSES \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
@@ -303,13 +393,12 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.validation_data_dir=validation_log/$EXPERIMENT_NAME \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=$TRAINER_N_GPUS_PER_NODE \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
+    trainer.save_freq=100 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
-    $TRAIN_TOTAL_STEPS_ARGS \
-    $RESUME_ARGS \
+    trainer.total_training_steps=$TRAIN_TOTAL_STEPS \
     trainer.default_local_dir="$CKPT_PATH" \
     trainer.is_plot=$IS_PLOT
 MAIN_STATUS=$?

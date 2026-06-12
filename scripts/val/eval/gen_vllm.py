@@ -68,7 +68,7 @@ REPLACE     = False
 def load_samples(filepath: str):
     """Read parquet file and return a list of prompts (no duplication)."""
     df = pd.read_parquet(filepath)
-    if "BRUMO25" in filepath or "CMIMC25" in filepath or "HMMT25" in filepath:
+    if "BRUMO25" in filepath or "CMIMC25" in filepath or "HMMT25" in filepath or "HMMT24" in filepath:
         samples = [
             {
                 "example_id": i,

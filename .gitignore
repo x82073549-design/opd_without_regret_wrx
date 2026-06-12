@@ -23,6 +23,7 @@ outputs/
 justrl_eval_outputs/
 wandb/
 runs/
+reports/
 
 # Local model downloads
 model/

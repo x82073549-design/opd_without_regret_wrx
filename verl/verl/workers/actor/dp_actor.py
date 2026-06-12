@@ -465,6 +465,9 @@ class DataParallelPPOActor(BasePPOActor):
         reward_weight_mode = data.meta_info.get("reward_weight_mode", "student_p")  # "student_p", "teacher_p", or "none"
         ratio_kl_switch_cfg = data.meta_info.get("ratio_kl_switch", None)
         ratio_kl_switch_enabled = bool(ratio_kl_switch_cfg.get("enable", False)) if ratio_kl_switch_cfg is not None else False
+        overlap_route_cfg = data.meta_info.get("overlap_route_opd", None)
+        overlap_route_enabled = bool(overlap_route_cfg.get("enable", False)) if overlap_route_cfg is not None else False
+        overlap_route_mode = overlap_route_cfg.get("mode", "prune_opd") if overlap_route_cfg is not None else "prune_opd"
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -472,7 +475,10 @@ class DataParallelPPOActor(BasePPOActor):
         # 2. Compute Student Log Probs on Teacher IDs if needed
         # (This replaces the previous call to compute_log_probs_for_ids in ray_trainer)
         S_on_T = None
-        if strategy in ["only_tch", "intersection", "union", "union-intersection"]:
+        need_student_on_teacher = strategy in ["only_tch", "intersection", "union", "union-intersection"] or (
+            overlap_route_enabled and overlap_route_mode in ["fkl_suffix", "prune_opd_event_fkl"]
+        )
+        if need_student_on_teacher:
             target_ids = data.batch["teacher_top_k_ids"]
             
             # Select keys for micro-batching
@@ -524,6 +530,8 @@ class DataParallelPPOActor(BasePPOActor):
         if candidate_kl_mask is not None: candidate_kl_mask = candidate_kl_mask.to(device).bool()
         prefix_gate = data.batch.get("prefix_gate", None)
         if prefix_gate is not None: prefix_gate = prefix_gate.to(device).to(S_logp.dtype)
+        oracle_ra_gate = data.batch.get("oracle_ra_gate", None)
+        if oracle_ra_gate is not None: oracle_ra_gate = oracle_ra_gate.to(device).to(S_logp.dtype)
         prefix_value_delta = data.batch.get("prefix_value_delta", None)
         if prefix_value_delta is not None: prefix_value_delta = prefix_value_delta.to(device).to(S_logp.dtype)
         generated_topk_index = data.batch.get("opd_generated_token_topk_index", None)
@@ -577,10 +585,13 @@ class DataParallelPPOActor(BasePPOActor):
                 valid_mask = valid_mask & candidate_kl_mask
 
             if ratio_kl_switch_enabled:
+                objective = ratio_kl_switch_cfg.get("objective", "rkl_fkl")
                 sample_distribution = ratio_kl_switch_cfg.get("sample_distribution", "bernoulli")
                 candidate_source = ratio_kl_switch_cfg.get("candidate_source", "student_topk")
                 ratio_top_k = int(ratio_kl_switch_cfg.get("top_k", top_k))
-                if sample_distribution != "bernoulli":
+                if objective not in ["rkl_fkl", "jsd"]:
+                    raise ValueError(f"Unsupported ratio_kl_switch.objective: {objective}")
+                if sample_distribution not in ["bernoulli", "soft"]:
                     raise ValueError(f"Unsupported ratio_kl_switch.sample_distribution: {sample_distribution}")
                 if candidate_source != "student_topk":
                     raise ValueError(f"Unsupported ratio_kl_switch.candidate_source: {candidate_source}")
@@ -612,16 +623,40 @@ class DataParallelPPOActor(BasePPOActor):
                 log_ratio_clip_min = float(ratio_kl_switch_cfg.get("log_ratio_clip_min", -80.0))
                 log_ratio_for_q = torch.clamp(log_ratio_raw.float(), min=log_ratio_clip_min, max=0.0)
                 trust_q = torch.exp(log_ratio_for_q).to(S_logp.dtype)
+                q_power = float(ratio_kl_switch_cfg.get("q_power", 1.0))
+                if q_power != 1.0:
+                    trust_q = torch.pow(trust_q.float().clamp(min=0.0, max=1.0), q_power).to(S_logp.dtype)
+                trust_q = trust_q.clamp(min=0.0, max=1.0)
 
                 if response_mask is None:
                     token_valid_mask = torch.ones_like(trust_q, dtype=torch.bool)
                 else:
                     token_valid_mask = response_mask
-                rkl_token_mask_bool = (torch.rand_like(trust_q.float()) < trust_q.float()) & token_valid_mask
-                rkl_token_mask = rkl_token_mask_bool.to(S_logp.dtype)
-                fkl_token_mask = (token_valid_mask & ~rkl_token_mask_bool).to(S_logp.dtype)
 
-                rm_scores = rkl_token_mask.unsqueeze(-1) * rkl_adv + fkl_token_mask.unsqueeze(-1) * fkl_adv
+                if objective == "rkl_fkl":
+                    if sample_distribution == "bernoulli":
+                        rkl_token_mask_bool = (torch.rand_like(trust_q.float()) < trust_q.float()) & token_valid_mask
+                        rkl_token_weight = rkl_token_mask_bool.to(S_logp.dtype)
+                    else:
+                        rkl_token_weight = torch.where(
+                            token_valid_mask,
+                            trust_q,
+                            torch.zeros_like(trust_q, dtype=S_logp.dtype),
+                        )
+                    fkl_token_weight = token_valid_mask.to(S_logp.dtype) - rkl_token_weight
+                    rm_scores = rkl_token_weight.unsqueeze(-1) * rkl_adv + fkl_token_weight.unsqueeze(-1) * fkl_adv
+                else:
+                    eps = 1e-8
+                    s_norm_p_f = s_norm_p.float()
+                    t_norm_p_f = t_norm_p.float()
+                    s_norm_logp_f = s_norm_logp.float()
+                    t_norm_logp_f = t_norm_logp.float()
+                    mix_p = (0.5 * (s_norm_p_f + t_norm_p_f)).clamp_min(eps)
+                    mix_logp = torch.log(mix_p)
+                    jsd_gap = torch.where(valid_mask, s_norm_logp_f - mix_logp, torch.zeros_like(s_norm_logp_f))
+                    jsd_adv = (-0.5 * s_norm_p_f * jsd_gap).to(S_logp.dtype)
+                    rm_scores = jsd_adv
+
                 rm_scores = torch.where(token_valid_mask.unsqueeze(-1), rm_scores, torch.zeros_like(rm_scores))
                 rm_scores = torch.nan_to_num(rm_scores, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -630,7 +665,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 prob_clip_min = min(log_ratio_clip_min, -80.0)
                 res_tensors["ratio_switch_q"] = trust_q.detach()
-                res_tensors["ratio_switch_rkl_mask"] = rkl_token_mask.detach()
+                if objective == "rkl_fkl":
+                    res_tensors["ratio_switch_rkl_mask"] = rkl_token_weight.detach()
                 res_tensors["ratio_switch_log_ratio"] = log_ratio_raw.detach()
                 res_tensors["ratio_switch_teacher_sampled_prob"] = torch.exp(
                     torch.clamp(teacher_sampled_logp.float(), min=prob_clip_min, max=0.0)
@@ -644,14 +680,142 @@ class DataParallelPPOActor(BasePPOActor):
                 res_tensors["ratio_switch_fkl_adv_mean_token"] = fkl_adv.mean(dim=-1).detach()
                 res_tensors["ratio_switch_fkl_adv_abs_mean_token"] = fkl_adv.abs().mean(dim=-1).detach()
                 res_tensors["ratio_switch_mixed_adv_abs_mean_token"] = rm_scores.abs().mean(dim=-1).detach()
+                if objective == "jsd":
+                    jsd_value = 0.5 * (
+                        (s_norm_p_f * (s_norm_logp_f - mix_logp)).sum(dim=-1)
+                        + (t_norm_p_f * (t_norm_logp_f - mix_logp)).sum(dim=-1)
+                    )
+                    res_tensors["ratio_switch_jsd_mean_token"] = jsd_value.detach()
+                    res_tensors["ratio_switch_jsd_adv_abs_mean_token"] = jsd_adv.abs().mean(dim=-1).detach()
             else:
                 kl_val = S_logp - T_on_S
                 kl_val = torch.where(valid_mask, kl_val, torch.zeros_like(kl_val))
                 norm_weights = compute_reward_weights(S_logp, T_on_S, valid_mask, reward_weight_mode)
                 rm_scores = -kl_val * norm_weights
 
+            if overlap_route_enabled:
+                if overlap_route_mode not in ["prune_opd", "prune_opd_event_fkl", "fkl_suffix"]:
+                    raise ValueError(f"Unsupported overlap_route_opd.mode: {overlap_route_mode}")
+                if overlap_mask is None:
+                    raise ValueError("overlap_route_opd requires overlap_mask from reward worker")
+                if response_mask is None:
+                    token_valid_mask = torch.ones_like(overlap_mask[..., 0], dtype=torch.bool)
+                else:
+                    token_valid_mask = response_mask.bool()
+
+                route_top_k = int(overlap_route_cfg.get("top_k", top_k))
+                if route_top_k != S_logp.shape[-1]:
+                    raise ValueError(
+                        f"overlap_route_opd.top_k={route_top_k} must match candidate dim {S_logp.shape[-1]}"
+                    )
+                trigger = overlap_route_cfg.get("trigger", "first_low")
+                if trigger != "first_low":
+                    raise ValueError("overlap_route_opd currently only supports trigger=first_low")
+
+                tau = float(overlap_route_cfg.get("tau", 0.7))
+                overlap_ratio = overlap_mask.float().mean(dim=-1)
+                low_event = (overlap_ratio < tau) & token_valid_mask
+                low_suffix_mask = (low_event.long().cumsum(dim=-1) > 0) & token_valid_mask
+                keep_mask = (~low_suffix_mask) & token_valid_mask
+
+                if overlap_route_mode in ["prune_opd", "prune_opd_event_fkl"]:
+                    wdrop = float(overlap_route_cfg.get("wdrop", 0.01))
+                    wbase = float(overlap_route_cfg.get("wbase", 0.5))
+                    cumulative_events = low_event.to(rm_scores.dtype).cumsum(dim=-1)
+                    raw_weight = torch.clamp(1.0 - wdrop * cumulative_events, min=0.0, max=1.0)
+                    loss_weight = raw_weight + wbase
+                    loss_weight = torch.where(token_valid_mask, loss_weight, torch.zeros_like(loss_weight))
+                    raw_weight = torch.where(token_valid_mask, raw_weight, torch.zeros_like(raw_weight))
+                    cumulative_events = torch.where(
+                        token_valid_mask, cumulative_events, torch.zeros_like(cumulative_events)
+                    )
+                    prune_weighted_rm_scores = rm_scores * loss_weight.to(rm_scores.dtype).unsqueeze(-1)
+                    rm_scores = prune_weighted_rm_scores
+                    fkl_mask = torch.zeros_like(low_suffix_mask, dtype=rm_scores.dtype)
+                    res_tensors["overlap_route_cumulative_events"] = cumulative_events.detach()
+                    res_tensors["overlap_route_raw_weight"] = raw_weight.detach()
+                    res_tensors["overlap_route_loss_weight"] = loss_weight.detach()
+                    res_tensors["overlap_route_prune_weighted_opd_reward_mean_token"] = prune_weighted_rm_scores.mean(dim=-1).detach()
+                    res_tensors["overlap_route_prune_weighted_opd_reward_abs_mean_token"] = prune_weighted_rm_scores.abs().mean(dim=-1).detach()
+
+                    if overlap_route_mode == "prune_opd_event_fkl":
+                        if T_ids is None or T_logp is None or S_on_T is None:
+                            raise ValueError(
+                                "overlap_route_opd prune_opd_event_fkl requires teacher top-k ids/logprobs "
+                                "and student logprobs on teacher ids"
+                            )
+                        fkl_coef = float(overlap_route_cfg.get("fkl_coef", 0.1))
+                        teacher_norm_logp = T_logp - torch.logsumexp(T_logp, dim=-1, keepdim=True)
+                        teacher_soft_label = torch.exp(teacher_norm_logp)
+                        teacher_soft_label = torch.nan_to_num(teacher_soft_label, nan=0.0, posinf=0.0, neginf=0.0)
+
+                        teacher_valid_mask = torch.ones_like(S_on_T, dtype=torch.bool)
+                        opd_on_teacher_kl = torch.where(teacher_valid_mask, S_on_T - T_logp, torch.zeros_like(S_on_T))
+                        opd_on_teacher_weights = compute_reward_weights(
+                            S_on_T, T_logp, teacher_valid_mask, reward_weight_mode
+                        )
+                        opd_on_teacher = -opd_on_teacher_kl * opd_on_teacher_weights
+                        opd_on_teacher = torch.nan_to_num(opd_on_teacher, nan=0.0, posinf=0.0, neginf=0.0)
+                        opd_on_teacher = opd_on_teacher * loss_weight.to(rm_scores.dtype).unsqueeze(-1)
+
+                        fkl_contribution = fkl_coef * teacher_soft_label.to(rm_scores.dtype)
+                        event_scores = opd_on_teacher + fkl_contribution
+                        event_mask_k = low_event.unsqueeze(-1)
+                        rm_scores = torch.where(event_mask_k, event_scores, prune_weighted_rm_scores)
+                        route_ids = torch.where(event_mask_k, T_ids, S_ids)
+                        route_old_logp = torch.where(event_mask_k, S_on_T, S_logp)
+                        res_tensors["union_top_k_ids"] = route_ids.detach()
+                        res_tensors["union_top_k_log_probs"] = route_old_logp.detach()
+                        res_tensors["student_log_probs_on_teacher_ids"] = S_on_T.detach()
+                        fkl_mask = low_event.to(rm_scores.dtype)
+
+                        zero_token = torch.zeros_like(overlap_ratio, dtype=rm_scores.dtype)
+                        event_fkl_reward = torch.where(
+                            low_event,
+                            fkl_contribution.mean(dim=-1),
+                            zero_token,
+                        )
+                        event_fkl_reward_abs = torch.where(
+                            low_event,
+                            fkl_contribution.abs().mean(dim=-1),
+                            zero_token,
+                        )
+                        res_tensors["overlap_route_event_fkl_mask"] = fkl_mask.detach()
+                        res_tensors["overlap_route_event_fkl_coef"] = torch.full_like(
+                            overlap_ratio, fkl_coef, dtype=rm_scores.dtype
+                        ).detach()
+                        res_tensors["overlap_route_event_fkl_reward_mean_token"] = event_fkl_reward.detach()
+                        res_tensors["overlap_route_event_fkl_reward_abs_mean_token"] = event_fkl_reward_abs.detach()
+                else:
+                    if T_ids is None or T_logp is None or S_on_T is None:
+                        raise ValueError("overlap_route_opd fkl_suffix requires teacher top-k ids/logprobs and student logprobs on teacher ids")
+                    teacher_norm_logp = T_logp - torch.logsumexp(T_logp, dim=-1, keepdim=True)
+                    teacher_soft_label = torch.exp(teacher_norm_logp)
+                    teacher_soft_label = torch.nan_to_num(teacher_soft_label, nan=0.0, posinf=0.0, neginf=0.0)
+                    suffix_mask_k = low_suffix_mask.unsqueeze(-1)
+                    rm_scores = torch.where(suffix_mask_k, teacher_soft_label.to(rm_scores.dtype), rm_scores)
+                    route_ids = torch.where(suffix_mask_k, T_ids, S_ids)
+                    route_old_logp = torch.where(suffix_mask_k, S_on_T, S_logp)
+                    res_tensors["union_top_k_ids"] = route_ids.detach()
+                    res_tensors["union_top_k_log_probs"] = route_old_logp.detach()
+                    res_tensors["student_log_probs_on_teacher_ids"] = S_on_T.detach()
+                    fkl_mask = low_suffix_mask.to(rm_scores.dtype)
+
+                triggered = low_event.any(dim=-1)
+                first_low_pos = torch.argmax(low_event.long(), dim=-1)
+                first_low_pos = torch.where(triggered, first_low_pos, torch.full_like(first_low_pos, -1))
+                rm_scores = torch.where(token_valid_mask.unsqueeze(-1), rm_scores, torch.zeros_like(rm_scores))
+                res_tensors["overlap_route_overlap"] = overlap_ratio.detach()
+                res_tensors["overlap_route_event_mask"] = low_event.to(rm_scores.dtype).detach()
+                res_tensors["overlap_route_low_suffix_mask"] = low_suffix_mask.to(rm_scores.dtype).detach()
+                res_tensors["overlap_route_fkl_mask"] = fkl_mask.detach()
+                res_tensors["overlap_route_triggered_response"] = triggered.to(rm_scores.dtype).detach()
+                res_tensors["overlap_route_first_low_pos"] = first_low_pos.detach()
+
             if prefix_gate is not None:
                 rm_scores = rm_scores * prefix_gate.unsqueeze(-1)
+            if oracle_ra_gate is not None:
+                rm_scores = rm_scores * oracle_ra_gate.unsqueeze(-1)
             if prefix_value_delta is not None:
                 if generated_topk_index is not None and generated_in_topk is not None:
                     delta_updates = torch.zeros_like(rm_scores)
@@ -696,6 +860,125 @@ class DataParallelPPOActor(BasePPOActor):
             res_tensors["union_top_k_ids"] = union_ids
             res_tensors["union_top_k_log_probs"] = S_logp_union
             res_tensors["student_log_probs_on_teacher_ids"] = S_on_T
+
+            if overlap_route_enabled:
+                if overlap_route_mode not in ["prune_opd_event_fkl", "union_rkl_teacher_fkl_switch"]:
+                    raise ValueError(
+                        "overlap_route_opd with top_k_strategy=union requires "
+                        "mode=prune_opd_event_fkl or union_rkl_teacher_fkl_switch"
+                    )
+                if overlap_mask is None:
+                    raise ValueError("overlap_route_opd requires overlap_mask from reward worker")
+                if response_mask is None:
+                    token_valid_mask = torch.ones_like(overlap_mask[..., 0], dtype=torch.bool)
+                else:
+                    token_valid_mask = response_mask.bool()
+
+                route_top_k = int(overlap_route_cfg.get("top_k", top_k))
+                if route_top_k != S_logp.shape[-1]:
+                    raise ValueError(
+                        f"overlap_route_opd.top_k={route_top_k} must match student candidate dim {S_logp.shape[-1]}"
+                    )
+                trigger = overlap_route_cfg.get("trigger", "first_low")
+                if trigger != "first_low":
+                    raise ValueError("overlap_route_opd currently only supports trigger=first_low")
+
+                tau = float(overlap_route_cfg.get("tau", 0.7))
+                overlap_ratio = overlap_mask.float().mean(dim=-1)
+                low_event = (overlap_ratio < tau) & token_valid_mask
+                event_mask_k = low_event.unsqueeze(-1)
+                fkl_coef = float(overlap_route_cfg.get("fkl_coef", 0.1))
+                fkl_mask = low_event.to(rm_scores.dtype)
+                triggered = low_event.any(dim=-1)
+                first_low_pos = torch.argmax(low_event.long(), dim=-1)
+                first_low_pos = torch.where(triggered, first_low_pos, torch.full_like(first_low_pos, -1))
+                zero_token = torch.zeros_like(overlap_ratio, dtype=rm_scores.dtype)
+
+                if overlap_route_mode == "prune_opd_event_fkl":
+                    low_suffix_mask = (low_event.long().cumsum(dim=-1) > 0) & token_valid_mask
+
+                    wdrop = float(overlap_route_cfg.get("wdrop", 0.01))
+                    wbase = float(overlap_route_cfg.get("wbase", 0.5))
+                    cumulative_events = low_event.to(rm_scores.dtype).cumsum(dim=-1)
+                    raw_weight = torch.clamp(1.0 - wdrop * cumulative_events, min=0.0, max=1.0)
+                    loss_weight = raw_weight + wbase
+                    loss_weight = torch.where(token_valid_mask, loss_weight, torch.zeros_like(loss_weight))
+                    raw_weight = torch.where(token_valid_mask, raw_weight, torch.zeros_like(raw_weight))
+                    cumulative_events = torch.where(
+                        token_valid_mask, cumulative_events, torch.zeros_like(cumulative_events)
+                    )
+
+                    prune_weighted_rm_scores = rm_scores * loss_weight.to(rm_scores.dtype).unsqueeze(-1)
+
+                    teacher_masked_logp = torch.where(
+                        valid_mask, T_logp_union, torch.full_like(T_logp_union, -float("inf"))
+                    )
+                    teacher_norm_logp = teacher_masked_logp - torch.logsumexp(teacher_masked_logp, dim=-1, keepdim=True)
+                    teacher_soft_label = torch.where(
+                        valid_mask, torch.exp(teacher_norm_logp), torch.zeros_like(T_logp_union)
+                    )
+                    teacher_soft_label = torch.nan_to_num(teacher_soft_label, nan=0.0, posinf=0.0, neginf=0.0)
+                    fkl_contribution = fkl_coef * teacher_soft_label.to(rm_scores.dtype)
+
+                    rm_scores = prune_weighted_rm_scores + event_mask_k.to(rm_scores.dtype) * fkl_contribution
+                    rm_scores = torch.where(token_valid_mask.unsqueeze(-1), rm_scores, torch.zeros_like(rm_scores))
+                    rm_scores = torch.nan_to_num(rm_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    event_fkl_reward = torch.where(
+                        low_event,
+                        fkl_contribution.mean(dim=-1),
+                        zero_token,
+                    )
+                    event_fkl_reward_abs = torch.where(
+                        low_event,
+                        fkl_contribution.abs().mean(dim=-1),
+                        zero_token,
+                    )
+
+                    res_tensors["overlap_route_low_suffix_mask"] = low_suffix_mask.to(rm_scores.dtype).detach()
+                    res_tensors["overlap_route_cumulative_events"] = cumulative_events.detach()
+                    res_tensors["overlap_route_raw_weight"] = raw_weight.detach()
+                    res_tensors["overlap_route_loss_weight"] = loss_weight.detach()
+                    res_tensors["overlap_route_prune_weighted_opd_reward_mean_token"] = prune_weighted_rm_scores.mean(dim=-1).detach()
+                    res_tensors["overlap_route_prune_weighted_opd_reward_abs_mean_token"] = prune_weighted_rm_scores.abs().mean(dim=-1).detach()
+                else:
+                    teacher_norm_logp = T_logp - torch.logsumexp(T_logp, dim=-1, keepdim=True)
+                    teacher_soft_label = torch.exp(teacher_norm_logp)
+                    teacher_soft_label = torch.nan_to_num(teacher_soft_label, nan=0.0, posinf=0.0, neginf=0.0)
+                    fkl_contribution = fkl_coef * teacher_soft_label.to(rm_scores.dtype)
+
+                    teacher_fkl_scores = torch.zeros_like(rm_scores)
+                    teacher_fkl_scores[..., route_top_k:] = fkl_contribution
+                    rm_scores = torch.where(event_mask_k, teacher_fkl_scores, rm_scores)
+                    rm_scores = torch.where(token_valid_mask.unsqueeze(-1), rm_scores, torch.zeros_like(rm_scores))
+                    rm_scores = torch.nan_to_num(rm_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    event_fkl_reward = torch.where(
+                        low_event,
+                        fkl_contribution.mean(dim=-1),
+                        zero_token,
+                    )
+                    event_fkl_reward_abs = torch.where(
+                        low_event,
+                        fkl_contribution.abs().mean(dim=-1),
+                        zero_token,
+                    )
+                    switch_union_rkl_mask = ((~low_event) & token_valid_mask).to(rm_scores.dtype)
+                    res_tensors["overlap_route_switch_teacher_fkl_mask"] = fkl_mask.detach()
+                    res_tensors["overlap_route_switch_union_rkl_mask"] = switch_union_rkl_mask.detach()
+                    res_tensors["overlap_route_switch_teacher_fkl_reward_abs_mean_token"] = event_fkl_reward_abs.detach()
+
+                res_tensors["overlap_route_overlap"] = overlap_ratio.detach()
+                res_tensors["overlap_route_event_mask"] = low_event.to(rm_scores.dtype).detach()
+                res_tensors["overlap_route_fkl_mask"] = fkl_mask.detach()
+                res_tensors["overlap_route_event_fkl_mask"] = fkl_mask.detach()
+                res_tensors["overlap_route_triggered_response"] = triggered.to(rm_scores.dtype).detach()
+                res_tensors["overlap_route_first_low_pos"] = first_low_pos.detach()
+                res_tensors["overlap_route_event_fkl_coef"] = torch.full_like(
+                    overlap_ratio, fkl_coef, dtype=rm_scores.dtype
+                ).detach()
+                res_tensors["overlap_route_event_fkl_reward_mean_token"] = event_fkl_reward.detach()
+                res_tensors["overlap_route_event_fkl_reward_abs_mean_token"] = event_fkl_reward_abs.detach()
         
         elif strategy == "union-intersection":
             union_ids = torch.cat([S_ids, T_ids], dim=-1)
@@ -845,6 +1128,8 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if "grpo_advantages" in data.batch.keys():
+            select_keys.append("grpo_advantages")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -907,7 +1192,9 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
+                    sampled_old_log_prob = old_log_prob
                     advantages = model_inputs["advantages"]
+                    grpo_advantages = model_inputs.get("grpo_advantages", None)
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -924,6 +1211,7 @@ class DataParallelPPOActor(BasePPOActor):
                     
                     # Check if we have 3D advantages (top-k sampling case)
                     # If so, we need to recompute top-k log probs for correct gradient
+                    sampled_log_prob_for_loss = None
                     if advantages.dim() == 3:
                         top_k = advantages.shape[-1]
                         # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
@@ -933,7 +1221,7 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, _, _, topk_log_probs = self._forward_micro_batch(
+                        entropy, sampled_log_prob_for_loss, _, topk_log_probs = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
                             top_k=top_k, student_top_k_ids=student_top_k_ids
                         )
@@ -944,6 +1232,7 @@ class DataParallelPPOActor(BasePPOActor):
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                         )
                         log_prob_for_loss = log_prob
+                        sampled_log_prob_for_loss = log_prob
 
                     format_mask = None
                     if "format_mask" in model_inputs.keys():
@@ -956,11 +1245,12 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         if on_policy:
                             print("on_policy")
-                            # For on-policy (ppo_epochs=1), use current policy as "old"
-                            # log_prob_for_loss is already 3D for top-k case
+                            # For on-policy (ppo_epochs=1), use current policy as "old".
                             old_log_prob = log_prob_for_loss.detach()
+                            sampled_old_log_prob = sampled_log_prob_for_loss.detach()
                         else:
                             print("off_policy")
+                            sampled_old_log_prob = model_inputs["old_log_probs"]
                             # For off-policy, use stored log probs
                             # For 3D top-k case, use stored log probs (union or student)
                             if advantages.dim() == 3:
@@ -1001,6 +1291,25 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
+
+                    if grpo_advantages is not None:
+                        grpo_pg_loss, grpo_pg_metrics = policy_loss_fn(
+                            old_log_prob=sampled_old_log_prob,
+                            log_prob=sampled_log_prob_for_loss,
+                            advantages=grpo_advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            format_mask=format_mask,
+                        )
+                        for metric_name, metric_value in grpo_pg_metrics.items():
+                            suffix = metric_name[len("actor/"):] if metric_name.startswith("actor/") else metric_name
+                            micro_batch_metrics[f"actor/grpo_{suffix}"] = metric_value
+                        micro_batch_metrics["actor/opd_pg_loss"] = pg_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/grpo_pg_loss"] = grpo_pg_loss.detach().item() * loss_scale_factor
+                        pg_loss = pg_loss + grpo_pg_loss
+                        micro_batch_metrics["actor/combined_pg_loss"] = pg_loss.detach().item() * loss_scale_factor
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

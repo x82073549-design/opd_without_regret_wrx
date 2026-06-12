@@ -46,11 +46,11 @@ Finally, we show that OPD's apparent free lunch of dense token-level reward come
 Our code is mainly based on [verl](https://github.com/verl-project/verl) (v0.7.0). To prepare the environment used for OPD and RL:
 
 ```bash
-conda create -n verl python==3.12
-conda activate verl
-cd verl/
-USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
-pip install math-verify
+conda create -n verl-opd -y -c conda-forge python=3.12 pytorch=2.8.0=*cuda129* cudnn=9.10.2.21 pip
+conda install -n verl-opd -y -c nvidia -c conda-forge cuda-toolkit=12.9
+conda activate verl-opd
+pip install -r requirements.txt
+source env.sh
 ```
 
 And we use [LlamaFactory](https://github.com/hiyouga/LLaMA-Factory) (v0.9.5) for SFT training. To prepare the environment for SFT:

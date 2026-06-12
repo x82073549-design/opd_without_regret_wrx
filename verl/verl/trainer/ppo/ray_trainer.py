@@ -49,6 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.oracle_ra_opd import OracleRAOPDHelper
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -414,6 +415,7 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self._oracle_ra_opd_helper = None
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -445,6 +447,15 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _get_oracle_ra_opd_helper(self, oracle_config: dict):
+        if self._oracle_ra_opd_helper is None:
+            self._oracle_ra_opd_helper = OracleRAOPDHelper(
+                oracle_config,
+                tokenizer=self.tokenizer,
+                max_response_length=int(self.config.data.max_response_length),
+            )
+        return self._oracle_ra_opd_helper
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1197,6 +1208,10 @@ class RayPPOTrainer:
                     with marked_timer("reward", timing_raw, color="yellow"):
                         prefix_correction = None
                         prefix_correction_enabled = False
+                        ratio_kl_switch_enabled = False
+                        overlap_route_enabled = False
+                        oracle_ra_opd_enabled = False
+                        grpo_gated_opd_enabled = False
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             with marked_timer("compute_log_prob", timing_raw, color="blue"):
@@ -1233,6 +1248,85 @@ class RayPPOTrainer:
                                 ratio_top_k = int(ratio_kl_switch.get("top_k", top_k))
                                 if ratio_top_k != top_k:
                                     raise ValueError("ratio_kl_switch.top_k must match actor_rollout_ref.rollout.log_prob_top_k")
+
+                            overlap_route_cfg = self.config.algorithm.get("overlap_route_opd", None)
+                            overlap_route = None
+                            overlap_route_enabled = False
+                            if overlap_route_cfg is not None:
+                                overlap_route = OmegaConf.to_container(overlap_route_cfg, resolve=True)
+                                overlap_route_enabled = bool(overlap_route.get("enable", False))
+                            if overlap_route_enabled:
+                                if top_k <= 0:
+                                    raise ValueError("overlap_route_opd currently requires top_k > 0")
+                                overlap_top_k = int(overlap_route.get("top_k", top_k))
+                                if overlap_top_k != top_k:
+                                    raise ValueError("overlap_route_opd.top_k must match actor_rollout_ref.rollout.log_prob_top_k")
+                                if overlap_route.get("mode", "prune_opd") not in [
+                                    "prune_opd",
+                                    "prune_opd_event_fkl",
+                                    "fkl_suffix",
+                                    "union_rkl_teacher_fkl_switch",
+                                ]:
+                                    raise ValueError(f"Unsupported overlap_route_opd.mode: {overlap_route.get('mode')}")
+                                if strategy not in ["only_stu", "union"]:
+                                    raise ValueError("overlap_route_opd currently supports top_k_strategy=only_stu or union")
+                                if strategy == "union" and overlap_route.get("mode", "prune_opd") not in [
+                                    "prune_opd_event_fkl",
+                                    "union_rkl_teacher_fkl_switch",
+                                ]:
+                                    raise ValueError(
+                                        "overlap_route_opd with top_k_strategy=union currently requires "
+                                        "mode=prune_opd_event_fkl or union_rkl_teacher_fkl_switch"
+                                    )
+                                if overlap_route.get("mode", "prune_opd") == "union_rkl_teacher_fkl_switch" and strategy != "union":
+                                    raise ValueError(
+                                        "overlap_route_opd mode=union_rkl_teacher_fkl_switch requires top_k_strategy=union"
+                                    )
+                                if overlap_route.get("trigger", "first_low") != "first_low":
+                                    raise ValueError("overlap_route_opd currently only supports trigger=first_low")
+                                if prefix_correction_enabled or ratio_kl_switch_enabled:
+                                    raise ValueError("overlap_route_opd should not be combined with prefix_correction or ratio_kl_switch")
+                                outcome_opd_mask_cfg_for_overlap = self.config.algorithm.get("outcome_opd_mask", None)
+                                if outcome_opd_mask_cfg_for_overlap is not None and outcome_opd_mask_cfg_for_overlap.get("enable", False):
+                                    raise ValueError("overlap_route_opd should not be combined with outcome_opd_mask")
+
+                            oracle_ra_opd_cfg = self.config.algorithm.get("oracle_ra_opd", None)
+                            oracle_ra_opd = None
+                            oracle_ra_opd_enabled = False
+                            if oracle_ra_opd_cfg is not None:
+                                oracle_ra_opd = OmegaConf.to_container(oracle_ra_opd_cfg, resolve=True)
+                                oracle_ra_opd_enabled = bool(oracle_ra_opd.get("enable", False))
+                            if oracle_ra_opd_enabled:
+                                if top_k <= 0 or strategy != "only_stu":
+                                    raise ValueError("oracle_ra_opd currently requires top_k > 0 and top_k_strategy=only_stu")
+                                if prefix_correction_enabled or ratio_kl_switch_enabled or overlap_route_enabled:
+                                    raise ValueError("oracle_ra_opd should not be combined with prefix_correction, ratio_kl_switch, or overlap_route_opd")
+                                outcome_opd_mask_cfg_for_oracle = self.config.algorithm.get("outcome_opd_mask", None)
+                                if outcome_opd_mask_cfg_for_oracle is not None and outcome_opd_mask_cfg_for_oracle.get("enable", False):
+                                    raise ValueError("oracle_ra_opd should not be combined with outcome_opd_mask")
+                                with marked_timer("oracle_ra_opd", timing_raw, color="cyan"):
+                                    helper = self._get_oracle_ra_opd_helper(oracle_ra_opd)
+                                    oracle_ra_gate, oracle_ra_metrics = helper.compute_gate(batch)
+                                    batch.batch["oracle_ra_gate"] = oracle_ra_gate
+                                    metrics.update(oracle_ra_metrics)
+
+                            grpo_gated_opd_cfg = self.config.algorithm.get("grpo_gated_opd", None)
+                            grpo_gated_opd_enabled = (
+                                self.config.algorithm.adv_estimator == "token_reward_direct_grpo_gated_opd"
+                                or (grpo_gated_opd_cfg is not None and grpo_gated_opd_cfg.get("enable", False))
+                            )
+                            if grpo_gated_opd_enabled:
+                                if self.config.algorithm.adv_estimator != "token_reward_direct_grpo_gated_opd":
+                                    raise ValueError("grpo_gated_opd requires algorithm.adv_estimator=token_reward_direct_grpo_gated_opd")
+                                if top_k <= 0 or strategy != "only_stu":
+                                    raise ValueError("grpo_gated_opd requires top_k > 0 and top_k_strategy=only_stu")
+                                if self.config.actor_rollout_ref.rollout.n <= 1:
+                                    raise ValueError("grpo_gated_opd requires actor_rollout_ref.rollout.n > 1")
+                                if prefix_correction_enabled or ratio_kl_switch_enabled or overlap_route_enabled or oracle_ra_opd_enabled:
+                                    raise ValueError("grpo_gated_opd should not be combined with prefix_correction, ratio_kl_switch, overlap_route_opd, or oracle_ra_opd")
+                                outcome_opd_mask_cfg_for_grpo = self.config.algorithm.get("outcome_opd_mask", None)
+                                if outcome_opd_mask_cfg_for_grpo is not None and outcome_opd_mask_cfg_for_grpo.get("enable", False):
+                                    raise ValueError("grpo_gated_opd should not be combined with outcome_opd_mask")
 
                             if prefix_correction_enabled and top_k > 0 and strategy == "only_stu":
                                 sampled_ids = batch.batch["responses"].unsqueeze(-1)
@@ -1272,6 +1366,8 @@ class RayPPOTrainer:
                                 batch.meta_info["prefix_correction"] = prefix_correction
                             if ratio_kl_switch_enabled:
                                 batch.meta_info["ratio_kl_switch"] = ratio_kl_switch
+                            if overlap_route_enabled:
+                                batch.meta_info["overlap_route_opd"] = overlap_route
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
@@ -1284,6 +1380,90 @@ class RayPPOTrainer:
                                 with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
                                     distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
                                     batch = batch.union(distillation_output)
+
+                                if overlap_route_enabled:
+                                    try:
+                                        response_mask = batch.batch["response_mask"].float()
+                                        mask_denom = response_mask.sum().clamp_min(1.0)
+
+                                        def masked_mean_2d(value):
+                                            return ((value.float() * response_mask).sum() / mask_denom).item()
+
+                                        overlap_value = batch.batch.get("overlap_route_overlap", None)
+                                        low_suffix = batch.batch.get("overlap_route_low_suffix_mask", None)
+                                        event_mask = batch.batch.get("overlap_route_event_mask", None)
+                                        fkl_mask = batch.batch.get("overlap_route_fkl_mask", None)
+                                        event_fkl_mask = batch.batch.get("overlap_route_event_fkl_mask", None)
+                                        event_fkl_coef = batch.batch.get("overlap_route_event_fkl_coef", None)
+                                        event_fkl_reward_mean = batch.batch.get("overlap_route_event_fkl_reward_mean_token", None)
+                                        event_fkl_reward_abs_mean = batch.batch.get("overlap_route_event_fkl_reward_abs_mean_token", None)
+                                        switch_teacher_fkl = batch.batch.get("overlap_route_switch_teacher_fkl_mask", None)
+                                        switch_union_rkl = batch.batch.get("overlap_route_switch_union_rkl_mask", None)
+                                        switch_teacher_fkl_reward_abs = batch.batch.get(
+                                            "overlap_route_switch_teacher_fkl_reward_abs_mean_token", None
+                                        )
+                                        prune_weighted_opd_reward_mean = batch.batch.get("overlap_route_prune_weighted_opd_reward_mean_token", None)
+                                        prune_weighted_opd_reward_abs_mean = batch.batch.get("overlap_route_prune_weighted_opd_reward_abs_mean_token", None)
+                                        cumulative_events = batch.batch.get("overlap_route_cumulative_events", None)
+                                        raw_weight = batch.batch.get("overlap_route_raw_weight", None)
+                                        loss_weight = batch.batch.get("overlap_route_loss_weight", None)
+                                        if overlap_value is not None:
+                                            metrics["overlap_route/overlap_mean"] = masked_mean_2d(overlap_value)
+                                        if event_mask is not None:
+                                            metrics["overlap_route/event_token_ratio"] = masked_mean_2d(event_mask)
+                                        if low_suffix is not None:
+                                            low_ratio = masked_mean_2d(low_suffix)
+                                            metrics["overlap_route/low_overlap_token_ratio"] = low_ratio
+                                            if loss_weight is None:
+                                                metrics["overlap_route/kept_token_ratio"] = 1.0 - low_ratio
+                                        if fkl_mask is not None:
+                                            metrics["overlap_route/fkl_token_ratio"] = masked_mean_2d(fkl_mask)
+                                        if event_fkl_mask is not None:
+                                            metrics["overlap_route/event_fkl_token_ratio"] = masked_mean_2d(event_fkl_mask)
+                                        if event_fkl_coef is not None:
+                                            metrics["overlap_route/event_fkl_coef"] = masked_mean_2d(event_fkl_coef)
+                                        if event_fkl_reward_mean is not None:
+                                            metrics["overlap_route/event_fkl_reward_mean"] = masked_mean_2d(event_fkl_reward_mean)
+                                        if event_fkl_reward_abs_mean is not None:
+                                            metrics["overlap_route/event_fkl_reward_abs_mean"] = masked_mean_2d(event_fkl_reward_abs_mean)
+                                        if switch_teacher_fkl is not None:
+                                            metrics["overlap_route/switch_teacher_fkl_token_ratio"] = masked_mean_2d(switch_teacher_fkl)
+                                        if switch_union_rkl is not None:
+                                            metrics["overlap_route/switch_union_rkl_token_ratio"] = masked_mean_2d(switch_union_rkl)
+                                        if switch_teacher_fkl_reward_abs is not None:
+                                            metrics["overlap_route/switch_teacher_fkl_reward_abs_mean"] = masked_mean_2d(
+                                                switch_teacher_fkl_reward_abs
+                                            )
+                                        if prune_weighted_opd_reward_mean is not None:
+                                            metrics["overlap_route/prune_weighted_opd_reward_mean"] = masked_mean_2d(prune_weighted_opd_reward_mean)
+                                        if prune_weighted_opd_reward_abs_mean is not None:
+                                            metrics["overlap_route/prune_weighted_opd_reward_abs_mean"] = masked_mean_2d(prune_weighted_opd_reward_abs_mean)
+                                        if cumulative_events is not None:
+                                            metrics["overlap_route/cumulative_event_mean"] = masked_mean_2d(cumulative_events)
+                                        if raw_weight is not None:
+                                            metrics["overlap_route/raw_weight_mean"] = masked_mean_2d(raw_weight)
+                                            valid_raw = raw_weight.float()[response_mask.bool()]
+                                            if valid_raw.numel() > 0:
+                                                metrics["overlap_route/raw_weight_min"] = valid_raw.min().item()
+                                        if loss_weight is not None:
+                                            metrics["overlap_route/loss_weight_mean"] = masked_mean_2d(loss_weight)
+                                            valid_weight = loss_weight.float()[response_mask.bool()]
+                                            if valid_weight.numel() > 0:
+                                                metrics["overlap_route/loss_weight_min"] = valid_weight.min().item()
+                                                metrics["overlap_route/loss_weight_max"] = valid_weight.max().item()
+                                                metrics["overlap_route/effective_token_ratio"] = (valid_weight > 1e-6).float().mean().item()
+                                        triggered = batch.batch.get("overlap_route_triggered_response", None)
+                                        first_low_pos = batch.batch.get("overlap_route_first_low_pos", None)
+                                        if triggered is not None:
+                                            triggered = triggered.float()
+                                            metrics["overlap_route/triggered_response_ratio"] = triggered.mean().item()
+                                            if first_low_pos is not None and triggered.sum() > 0:
+                                                first_low_pos = first_low_pos.float().clamp_min(0.0)
+                                                metrics["overlap_route/first_low_pos_mean"] = (
+                                                    (first_low_pos * triggered).sum() / triggered.sum().clamp_min(1.0)
+                                                ).item()
+                                    except Exception as e:
+                                        print(f"Error logging overlap_route_opd metrics: {e}")
 
                                 if ratio_kl_switch_enabled:
                                     try:
@@ -1322,6 +1502,8 @@ class RayPPOTrainer:
                                             "ratio_switch_fkl_adv_mean_token": "ratio_switch/fkl_adv_mean",
                                             "ratio_switch_fkl_adv_abs_mean_token": "ratio_switch/fkl_adv_abs_mean",
                                             "ratio_switch_mixed_adv_abs_mean_token": "ratio_switch/mixed_adv_abs_mean",
+                                            "ratio_switch_jsd_mean_token": "ratio_switch/jsd_mean",
+                                            "ratio_switch_jsd_adv_abs_mean_token": "ratio_switch/jsd_adv_abs_mean",
                                         }
                                         for tensor_key, metric_key in metric_key_map.items():
                                             value = batch.batch.get(tensor_key, None)
@@ -1641,27 +1823,105 @@ class RayPPOTrainer:
                             else:
                                 metrics["opd_mask/skipped_no_true_reward_score"] = 1.0
 
-                        if ratio_kl_switch_enabled and "ratio_switch_rkl_mask" in batch.batch.keys():
+                        if ratio_kl_switch_enabled and "ratio_switch_q" in batch.batch.keys():
                             try:
                                 response_mask = batch.batch["response_mask"].float()
                                 true_reward_score = batch.batch["true_reward_score"]
                                 if true_reward_score.dim() > 1:
                                     true_reward_score = true_reward_score.sum(dim=-1)
-                                rkl_mask = batch.batch["ratio_switch_rkl_mask"].float()
+                                correct_mask = (true_reward_score > 0.5).float().unsqueeze(-1) * response_mask
+                                wrong_mask = (true_reward_score <= 0.5).float().unsqueeze(-1) * response_mask
+
+                                def masked_group_mean(value, mask, denom):
+                                    return ((value.float() * mask).sum() / denom).item()
+
+                                def masked_group_std(value, mask, denom):
+                                    value = value.float()
+                                    mean = (value * mask).sum() / denom
+                                    var = (((value - mean) ** 2) * mask).sum() / denom
+                                    return torch.sqrt(var.clamp_min(0.0)).item()
+
+                                q = batch.batch["ratio_switch_q"].float()
+                                rkl_mask = batch.batch.get("ratio_switch_rkl_mask", None)
+                                if rkl_mask is not None:
+                                    rkl_mask = rkl_mask.float()
+                                correct_denom = correct_mask.sum()
+                                wrong_denom = wrong_mask.sum()
+                                for label, group_mask, denom in [
+                                    ("correct", correct_mask, correct_denom),
+                                    ("wrong", wrong_mask, wrong_denom),
+                                ]:
+                                    if denom > 0:
+                                        metrics[f"ratio_switch/{label}_q_mean"] = masked_group_mean(q, group_mask, denom)
+                                        metrics[f"ratio_switch/{label}_q_std"] = masked_group_std(q, group_mask, denom)
+                                        metrics[f"ratio_switch/{label}_low_q_ratio_0.5"] = masked_group_mean(
+                                            (q < 0.5).float(), group_mask, denom
+                                        )
+                                        metrics[f"ratio_switch/{label}_low_q_ratio_0.2"] = masked_group_mean(
+                                            (q < 0.2).float(), group_mask, denom
+                                        )
+                                        if rkl_mask is not None:
+                                            metrics[f"ratio_switch/{label}_rkl_token_ratio"] = masked_group_mean(
+                                                rkl_mask, group_mask, denom
+                                            )
+                            except Exception as e:
+                                print(f"Error logging ratio_kl_switch correctness metrics: {e}")
+
+                        if overlap_route_enabled and "overlap_route_low_suffix_mask" in batch.batch.keys():
+                            try:
+                                response_mask = batch.batch["response_mask"].float()
+                                low_suffix = batch.batch["overlap_route_low_suffix_mask"].float()
+                                loss_weight = batch.batch.get("overlap_route_loss_weight", None)
+                                true_reward_score = batch.batch["true_reward_score"]
+                                if true_reward_score.dim() > 1:
+                                    true_reward_score = true_reward_score.sum(dim=-1)
+                                correct_mask = (true_reward_score > 0.5).float().unsqueeze(-1) * response_mask
+                                wrong_mask = (true_reward_score <= 0.5).float().unsqueeze(-1) * response_mask
+                                correct_denom = correct_mask.sum()
+                                wrong_denom = wrong_mask.sum()
+                                if loss_weight is not None:
+                                    loss_weight = loss_weight.float()
+                                    if correct_denom > 0:
+                                        metrics["overlap_route/correct_loss_weight_mean"] = (
+                                            (loss_weight * correct_mask).sum() / correct_denom
+                                        ).item()
+                                    if wrong_denom > 0:
+                                        metrics["overlap_route/wrong_loss_weight_mean"] = (
+                                            (loss_weight * wrong_mask).sum() / wrong_denom
+                                        ).item()
+                                else:
+                                    if correct_denom > 0:
+                                        metrics["overlap_route/correct_low_overlap_ratio"] = (
+                                            (low_suffix * correct_mask).sum() / correct_denom
+                                        ).item()
+                                    if wrong_denom > 0:
+                                        metrics["overlap_route/wrong_low_overlap_ratio"] = (
+                                            (low_suffix * wrong_mask).sum() / wrong_denom
+                                        ).item()
+                            except Exception as e:
+                                print(f"Error logging overlap_route_opd correctness metrics: {e}")
+
+                        if oracle_ra_opd_enabled and "oracle_ra_gate" in batch.batch.keys():
+                            try:
+                                response_mask = batch.batch["response_mask"].float()
+                                oracle_gate = batch.batch["oracle_ra_gate"].float()
+                                true_reward_score = batch.batch["true_reward_score"]
+                                if true_reward_score.dim() > 1:
+                                    true_reward_score = true_reward_score.sum(dim=-1)
                                 correct_mask = (true_reward_score > 0.5).float().unsqueeze(-1) * response_mask
                                 wrong_mask = (true_reward_score <= 0.5).float().unsqueeze(-1) * response_mask
                                 correct_denom = correct_mask.sum()
                                 wrong_denom = wrong_mask.sum()
                                 if correct_denom > 0:
-                                    metrics["ratio_switch/correct_rkl_token_ratio"] = (
-                                        (rkl_mask * correct_mask).sum() / correct_denom
+                                    metrics["oracle_ra/correct_gate_mean"] = (
+                                        (oracle_gate * correct_mask).sum() / correct_denom
                                     ).item()
                                 if wrong_denom > 0:
-                                    metrics["ratio_switch/wrong_rkl_token_ratio"] = (
-                                        (rkl_mask * wrong_mask).sum() / wrong_denom
+                                    metrics["oracle_ra/wrong_gate_mean"] = (
+                                        (oracle_gate * wrong_mask).sum() / wrong_denom
                                     ).item()
                             except Exception as e:
-                                print(f"Error logging ratio_kl_switch correctness metrics: {e}")
+                                print(f"Error logging oracle_ra correctness metrics: {e}")
 
                         if prefix_correction_enabled and "prefix_value" in batch.batch.keys():
                             try:
@@ -1724,7 +1984,43 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
- 
+
+                        if "grpo_advantages" in batch.batch.keys():
+                            try:
+                                response_mask = batch.batch["response_mask"].float()
+                                valid_token_mask = response_mask.bool()
+                                valid_token_count = response_mask.sum().clamp_min(1.0)
+
+                                opd_gate = batch.batch.get("grpo_gated_opd_opd_gate", None)
+                                outcome_score = batch.batch.get("grpo_gated_opd_outcome_score", None)
+                                scalar_adv = batch.batch.get("grpo_gated_opd_grpo_scalar_advantage", None)
+                                grpo_adv = batch.batch["grpo_advantages"].float()
+                                opd_adv = batch.batch["advantages"].float()
+
+                                if opd_gate is not None:
+                                    metrics["grpo_gated_opd/opd_gate_ratio"] = opd_gate.float().mean().item()
+                                if outcome_score is not None:
+                                    cfg = self.config.algorithm.get("grpo_gated_opd", None)
+                                    threshold = 0.5 if cfg is None else float(cfg.get("correct_threshold", 0.5))
+                                    metrics["grpo_gated_opd/correct_ratio"] = (outcome_score.float() > threshold).float().mean().item()
+                                if scalar_adv is not None:
+                                    scalar_adv = scalar_adv.float()
+                                    metrics["grpo_gated_opd/grpo_adv_mean"] = scalar_adv.mean().item()
+                                    metrics["grpo_gated_opd/grpo_adv_std"] = scalar_adv.std(unbiased=False).item() if scalar_adv.numel() > 1 else 0.0
+                                    metrics["grpo_gated_opd/grpo_adv_pos_ratio"] = (scalar_adv > 0).float().mean().item()
+                                    metrics["grpo_gated_opd/grpo_adv_neg_ratio"] = (scalar_adv < 0).float().mean().item()
+
+                                valid_grpo_adv = grpo_adv[valid_token_mask]
+                                if valid_grpo_adv.numel() > 0:
+                                    metrics["grpo_gated_opd/grpo_adv_abs_mean"] = valid_grpo_adv.abs().mean().item()
+                                if opd_adv.dim() == 3:
+                                    opd_mask = response_mask.unsqueeze(-1).expand_as(opd_adv)
+                                    denom = opd_mask.sum().clamp_min(1.0)
+                                    metrics["grpo_gated_opd/opd_adv_abs_mean"] = (opd_adv.abs() * opd_mask).sum().div(denom).item()
+                                else:
+                                    metrics["grpo_gated_opd/opd_adv_abs_mean"] = (opd_adv.abs() * response_mask).sum().div(valid_token_count).item()
+                            except Exception as e:
+                                print(f"Error logging grpo_gated_opd metrics: {e}")
 
                         # --- Top-K Metrics Analysis (Chunked) ---
                         if "overlap_mask" in batch.batch.keys() and "advantages" in batch.batch.keys():
@@ -2594,6 +2890,7 @@ class RayPPOTrainer:
                         "ratio_switch_fkl_adv_abs_mean_token",
                         "ratio_switch_mixed_adv_abs_mean_token",
                         "prefix_gate",
+                        "oracle_ra_gate",
                         "prefix_value_delta",
                         "prefix_value",
                         "prefix_value_mask",
@@ -2604,6 +2901,11 @@ class RayPPOTrainer:
                         "opd_sampled_token_in_topk",
                         "opd_generated_token_in_topk",
                         "opd_generated_token_topk_index",
+                        "grpo_gated_opd_opd_gate",
+                        "grpo_gated_opd_outcome_score",
+                        "grpo_gated_opd_grpo_scalar_advantage",
+                        "grpo_gated_opd_opd_adv_abs_mean_token",
+                        "grpo_gated_opd_grpo_adv_abs_token",
                     ]
                     for key in keys_to_pop:
                         if key in batch.batch.keys():
