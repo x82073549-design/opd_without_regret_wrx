@@ -1328,6 +1328,85 @@ class RayPPOTrainer:
                                 if outcome_opd_mask_cfg_for_grpo is not None and outcome_opd_mask_cfg_for_grpo.get("enable", False):
                                     raise ValueError("grpo_gated_opd should not be combined with outcome_opd_mask")
 
+                            topk_token_gate_opd_cfg = self.config.algorithm.get("topk_token_gate_opd", None)
+                            topk_token_gate_opd = None
+                            topk_token_gate_opd_enabled = False
+                            if topk_token_gate_opd_cfg is not None:
+                                topk_token_gate_opd = OmegaConf.to_container(topk_token_gate_opd_cfg, resolve=True)
+                                topk_token_gate_opd_enabled = bool(topk_token_gate_opd.get("enable", False))
+
+                            sampled_token_gate_opd_cfg = self.config.algorithm.get("sampled_token_gate_opd", None)
+                            sampled_token_gate_opd = None
+                            sampled_token_gate_opd_enabled = False
+                            if sampled_token_gate_opd_cfg is not None:
+                                sampled_token_gate_opd = OmegaConf.to_container(sampled_token_gate_opd_cfg, resolve=True)
+                                sampled_token_gate_opd_enabled = bool(sampled_token_gate_opd.get("enable", False))
+
+                            if sampled_token_gate_opd_enabled and topk_token_gate_opd_enabled:
+                                raise ValueError(
+                                    "sampled_token_gate_opd and topk_token_gate_opd should not be enabled together"
+                                )
+
+                            sampled_gate_for_reward = None
+                            if sampled_token_gate_opd_enabled:
+                                if top_k <= 0 or strategy != "only_stu":
+                                    raise ValueError("sampled_token_gate_opd requires top_k > 0 and top_k_strategy=only_stu")
+                                if prefix_correction_enabled or ratio_kl_switch_enabled or overlap_route_enabled or oracle_ra_opd_enabled:
+                                    raise ValueError(
+                                        "sampled_token_gate_opd should not be combined with prefix_correction, "
+                                        "ratio_kl_switch, overlap_route_opd, or oracle_ra_opd in v1"
+                                    )
+                                if grpo_gated_opd_enabled:
+                                    raise ValueError("sampled_token_gate_opd should not be combined with grpo_gated_opd")
+                                if (
+                                    self.config.algorithm.adv_estimator == "grpo_scaled_token_gated_opd"
+                                    and self.config.actor_rollout_ref.rollout.n <= 1
+                                ):
+                                    raise ValueError(
+                                        "GRPO + sampled_token_gate_opd requires actor_rollout_ref.rollout.n > 1"
+                                    )
+                                sampled_gate_for_reward = dict(sampled_token_gate_opd)
+                                sampled_gate_for_reward.setdefault("gate_mode", "log_ratio_sigmoid")
+                                sampled_gate_for_reward.setdefault("beta", 1.0)
+                                sampled_gate_for_reward.setdefault("center", 0.0)
+                                sampled_gate_for_reward.setdefault("min_gate", 0.0)
+                                sampled_gate_for_reward.setdefault("opd_coef", 1.0)
+                                sampled_gate_for_reward.setdefault("metric_prefix", "sampled_gate")
+
+                            topk_gate_for_reward = None
+                            if topk_token_gate_opd_enabled:
+                                if top_k <= 0 or strategy not in ["only_stu", "union"]:
+                                    raise ValueError(
+                                        "topk_token_gate_opd requires top_k > 0 and top_k_strategy=only_stu or union"
+                                    )
+                                if prefix_correction_enabled or ratio_kl_switch_enabled or overlap_route_enabled or oracle_ra_opd_enabled:
+                                    raise ValueError(
+                                        "topk_token_gate_opd should not be combined with prefix_correction, "
+                                        "ratio_kl_switch, overlap_route_opd, or oracle_ra_opd in v1"
+                                    )
+                                if grpo_gated_opd_enabled:
+                                    raise ValueError("topk_token_gate_opd should not be combined with grpo_gated_opd")
+                                outcome_opd_mask_cfg_for_topk_gate = self.config.algorithm.get("outcome_opd_mask", None)
+                                if (
+                                    outcome_opd_mask_cfg_for_topk_gate is not None
+                                    and outcome_opd_mask_cfg_for_topk_gate.get("enable", False)
+                                ):
+                                    raise ValueError("topk_token_gate_opd should not be combined with outcome_opd_mask in v1")
+                                if (
+                                    self.config.algorithm.adv_estimator == "grpo_scaled_token_gated_opd"
+                                    and self.config.actor_rollout_ref.rollout.n <= 1
+                                ):
+                                    raise ValueError("GRPO + topk_token_gate_opd requires actor_rollout_ref.rollout.n > 1")
+
+                                topk_gate_for_reward = dict(topk_token_gate_opd)
+                                topk_gate_for_reward.setdefault("gate_mode", "log_ratio_sigmoid")
+                                topk_gate_for_reward.setdefault("gate_source", "topk_gap")
+                                topk_gate_for_reward.setdefault("beta", 1.0)
+                                topk_gate_for_reward.setdefault("center", 0.0)
+                                topk_gate_for_reward.setdefault("min_gate", 0.0)
+                                topk_gate_for_reward.setdefault("opd_coef", 1.0)
+                                topk_gate_for_reward.setdefault("metric_prefix", "topk_gate")
+
                             if prefix_correction_enabled and top_k > 0 and strategy == "only_stu":
                                 sampled_ids = batch.batch["responses"].unsqueeze(-1)
                                 student_top_k_ids = batch.batch["student_top_k_ids"]
@@ -1368,6 +1447,10 @@ class RayPPOTrainer:
                                 batch.meta_info["ratio_kl_switch"] = ratio_kl_switch
                             if overlap_route_enabled:
                                 batch.meta_info["overlap_route_opd"] = overlap_route
+                            if topk_gate_for_reward is not None:
+                                batch.meta_info["topk_token_gate_opd"] = topk_gate_for_reward
+                            if sampled_gate_for_reward is not None:
+                                batch.meta_info["sampled_token_gate_opd"] = sampled_gate_for_reward
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
@@ -1380,6 +1463,81 @@ class RayPPOTrainer:
                                 with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
                                     distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
                                     batch = batch.union(distillation_output)
+
+                                if topk_gate_for_reward is not None:
+                                    try:
+                                        response_mask = batch.batch["response_mask"].float()
+                                        mask_denom = response_mask.sum().clamp_min(1.0)
+                                        metric_prefix = topk_gate_for_reward.get("metric_prefix", "topk_gate")
+
+                                        def masked_mean_2d(value):
+                                            return ((value.float() * response_mask).sum() / mask_denom).item()
+
+                                        def masked_std_2d(value):
+                                            value = value.float()
+                                            mean = (value * response_mask).sum() / mask_denom
+                                            var = (((value - mean) ** 2) * response_mask).sum() / mask_denom
+                                            return torch.sqrt(var.clamp_min(0.0)).item()
+
+                                        metric_key_map = {
+                                            f"{metric_prefix}_gate_mean_token": f"{metric_prefix}/gate_mean",
+                                            f"{metric_prefix}_gate_std_token": f"{metric_prefix}/gate_within_topk_std_mean",
+                                            f"{metric_prefix}_gate_low_ratio_0p2_token": f"{metric_prefix}/gate_low_ratio_0.2",
+                                            f"{metric_prefix}_gate_high_ratio_0p8_token": f"{metric_prefix}/gate_high_ratio_0.8",
+                                            f"{metric_prefix}_gap_mean_token": f"{metric_prefix}/gap_mean",
+                                            f"{metric_prefix}_gap_std_token": f"{metric_prefix}/gap_within_topk_std_mean",
+                                            f"{metric_prefix}_ungated_reward_abs_mean_token": f"{metric_prefix}/ungated_reward_abs_mean",
+                                            f"{metric_prefix}_gated_reward_abs_mean_token": f"{metric_prefix}/gated_reward_abs_mean",
+                                        }
+                                        for tensor_key, metric_key in metric_key_map.items():
+                                            value = batch.batch.get(tensor_key, None)
+                                            if value is not None:
+                                                metrics[metric_key] = masked_mean_2d(value)
+                                        gap_mean = batch.batch.get(f"{metric_prefix}_gap_mean_token", None)
+                                        gate_mean = batch.batch.get(f"{metric_prefix}_gate_mean_token", None)
+                                        if gap_mean is not None:
+                                            metrics[f"{metric_prefix}/gap_token_std"] = masked_std_2d(gap_mean)
+                                        if gate_mean is not None:
+                                            metrics[f"{metric_prefix}/gate_token_std"] = masked_std_2d(gate_mean)
+                                    except Exception as e:
+                                        print(f"Error logging topk_token_gate_opd metrics: {e}")
+
+                                if sampled_gate_for_reward is not None:
+                                    try:
+                                        response_mask = batch.batch["response_mask"].float()
+                                        mask_denom = response_mask.sum().clamp_min(1.0)
+                                        metric_prefix = sampled_gate_for_reward.get("metric_prefix", "sampled_gate")
+
+                                        def masked_mean_2d(value):
+                                            return ((value.float() * response_mask).sum() / mask_denom).item()
+
+                                        def masked_std_2d(value):
+                                            value = value.float()
+                                            mean = (value * response_mask).sum() / mask_denom
+                                            var = (((value - mean) ** 2) * response_mask).sum() / mask_denom
+                                            return torch.sqrt(var.clamp_min(0.0)).item()
+
+                                        metric_key_map = {
+                                            f"{metric_prefix}_gate": f"{metric_prefix}/gate_mean",
+                                            f"{metric_prefix}_gap": f"{metric_prefix}/gap_mean",
+                                            f"{metric_prefix}_gate_low_ratio_0p2": f"{metric_prefix}/gate_low_ratio_0.2",
+                                            f"{metric_prefix}_gate_high_ratio_0p8": f"{metric_prefix}/gate_high_ratio_0.8",
+                                            f"{metric_prefix}_ungated_topk_opd_abs_mean_token": f"{metric_prefix}/ungated_topk_opd_abs_mean",
+                                            f"{metric_prefix}_gated_topk_opd_abs_mean_token": f"{metric_prefix}/gated_topk_opd_abs_mean",
+                                        }
+                                        for tensor_key, metric_key in metric_key_map.items():
+                                            value = batch.batch.get(tensor_key, None)
+                                            if value is not None:
+                                                metrics[metric_key] = masked_mean_2d(value)
+
+                                        gate_value = batch.batch.get(f"{metric_prefix}_gate", None)
+                                        gap_value = batch.batch.get(f"{metric_prefix}_gap", None)
+                                        if gate_value is not None:
+                                            metrics[f"{metric_prefix}/gate_std"] = masked_std_2d(gate_value)
+                                        if gap_value is not None:
+                                            metrics[f"{metric_prefix}/gap_std"] = masked_std_2d(gap_value)
+                                    except Exception as e:
+                                        print(f"Error logging sampled_token_gate_opd metrics: {e}")
 
                                 if overlap_route_enabled:
                                     try:
@@ -1991,36 +2149,49 @@ class RayPPOTrainer:
                                 valid_token_mask = response_mask.bool()
                                 valid_token_count = response_mask.sum().clamp_min(1.0)
 
+                                if "sampled_gated_opd_grpo_scalar_advantage" in batch.batch.keys():
+                                    metric_prefix = "sampled_gated_opd"
+                                elif "topk_gated_opd_grpo_scalar_advantage" in batch.batch.keys():
+                                    metric_prefix = "topk_gated_opd"
+                                else:
+                                    metric_prefix = "grpo_gated_opd"
                                 opd_gate = batch.batch.get("grpo_gated_opd_opd_gate", None)
-                                outcome_score = batch.batch.get("grpo_gated_opd_outcome_score", None)
-                                scalar_adv = batch.batch.get("grpo_gated_opd_grpo_scalar_advantage", None)
+                                outcome_score = batch.batch.get(f"{metric_prefix}_outcome_score", None)
+                                if outcome_score is None:
+                                    outcome_score = batch.batch.get("grpo_gated_opd_outcome_score", None)
+                                scalar_adv = batch.batch.get(f"{metric_prefix}_grpo_scalar_advantage", None)
+                                if scalar_adv is None:
+                                    scalar_adv = batch.batch.get("grpo_gated_opd_grpo_scalar_advantage", None)
                                 grpo_adv = batch.batch["grpo_advantages"].float()
                                 opd_adv = batch.batch["advantages"].float()
 
                                 if opd_gate is not None:
-                                    metrics["grpo_gated_opd/opd_gate_ratio"] = opd_gate.float().mean().item()
+                                    metrics[f"{metric_prefix}/opd_gate_ratio"] = opd_gate.float().mean().item()
                                 if outcome_score is not None:
-                                    cfg = self.config.algorithm.get("grpo_gated_opd", None)
-                                    threshold = 0.5 if cfg is None else float(cfg.get("correct_threshold", 0.5))
-                                    metrics["grpo_gated_opd/correct_ratio"] = (outcome_score.float() > threshold).float().mean().item()
+                                    if metric_prefix in ["sampled_gated_opd", "topk_gated_opd"]:
+                                        metrics[f"{metric_prefix}/correct_ratio"] = (outcome_score.float() > 0.5).float().mean().item()
+                                    else:
+                                        cfg = self.config.algorithm.get("grpo_gated_opd", None)
+                                        threshold = 0.5 if cfg is None else float(cfg.get("correct_threshold", 0.5))
+                                        metrics[f"{metric_prefix}/correct_ratio"] = (outcome_score.float() > threshold).float().mean().item()
                                 if scalar_adv is not None:
                                     scalar_adv = scalar_adv.float()
-                                    metrics["grpo_gated_opd/grpo_adv_mean"] = scalar_adv.mean().item()
-                                    metrics["grpo_gated_opd/grpo_adv_std"] = scalar_adv.std(unbiased=False).item() if scalar_adv.numel() > 1 else 0.0
-                                    metrics["grpo_gated_opd/grpo_adv_pos_ratio"] = (scalar_adv > 0).float().mean().item()
-                                    metrics["grpo_gated_opd/grpo_adv_neg_ratio"] = (scalar_adv < 0).float().mean().item()
+                                    metrics[f"{metric_prefix}/grpo_adv_mean"] = scalar_adv.mean().item()
+                                    metrics[f"{metric_prefix}/grpo_adv_std"] = scalar_adv.std(unbiased=False).item() if scalar_adv.numel() > 1 else 0.0
+                                    metrics[f"{metric_prefix}/grpo_adv_pos_ratio"] = (scalar_adv > 0).float().mean().item()
+                                    metrics[f"{metric_prefix}/grpo_adv_neg_ratio"] = (scalar_adv < 0).float().mean().item()
 
                                 valid_grpo_adv = grpo_adv[valid_token_mask]
                                 if valid_grpo_adv.numel() > 0:
-                                    metrics["grpo_gated_opd/grpo_adv_abs_mean"] = valid_grpo_adv.abs().mean().item()
+                                    metrics[f"{metric_prefix}/grpo_adv_abs_mean"] = valid_grpo_adv.abs().mean().item()
                                 if opd_adv.dim() == 3:
                                     opd_mask = response_mask.unsqueeze(-1).expand_as(opd_adv)
                                     denom = opd_mask.sum().clamp_min(1.0)
-                                    metrics["grpo_gated_opd/opd_adv_abs_mean"] = (opd_adv.abs() * opd_mask).sum().div(denom).item()
+                                    metrics[f"{metric_prefix}/opd_adv_abs_mean"] = (opd_adv.abs() * opd_mask).sum().div(denom).item()
                                 else:
-                                    metrics["grpo_gated_opd/opd_adv_abs_mean"] = (opd_adv.abs() * response_mask).sum().div(valid_token_count).item()
+                                    metrics[f"{metric_prefix}/opd_adv_abs_mean"] = (opd_adv.abs() * response_mask).sum().div(valid_token_count).item()
                             except Exception as e:
-                                print(f"Error logging grpo_gated_opd metrics: {e}")
+                                print(f"Error logging GRPO+OPD metrics: {e}")
 
                         # --- Top-K Metrics Analysis (Chunked) ---
                         if "overlap_mask" in batch.batch.keys() and "advantages" in batch.batch.keys():
@@ -2906,6 +3077,28 @@ class RayPPOTrainer:
                         "grpo_gated_opd_grpo_scalar_advantage",
                         "grpo_gated_opd_opd_adv_abs_mean_token",
                         "grpo_gated_opd_grpo_adv_abs_token",
+                        "topk_gated_opd_outcome_score",
+                        "topk_gated_opd_grpo_scalar_advantage",
+                        "topk_gated_opd_opd_adv_abs_mean_token",
+                        "topk_gated_opd_grpo_adv_abs_token",
+                        "sampled_gated_opd_outcome_score",
+                        "sampled_gated_opd_grpo_scalar_advantage",
+                        "sampled_gated_opd_opd_adv_abs_mean_token",
+                        "sampled_gated_opd_grpo_adv_abs_token",
+                        "topk_gate_gate_mean_token",
+                        "topk_gate_gate_std_token",
+                        "topk_gate_gate_low_ratio_0p2_token",
+                        "topk_gate_gate_high_ratio_0p8_token",
+                        "topk_gate_gap_mean_token",
+                        "topk_gate_gap_std_token",
+                        "topk_gate_ungated_reward_abs_mean_token",
+                        "topk_gate_gated_reward_abs_mean_token",
+                        "sampled_gate_gate",
+                        "sampled_gate_gap",
+                        "sampled_gate_gate_low_ratio_0p2",
+                        "sampled_gate_gate_high_ratio_0p8",
+                        "sampled_gate_ungated_topk_opd_abs_mean_token",
+                        "sampled_gate_gated_topk_opd_abs_mean_token",
                     ]
                     for key in keys_to_pop:
                         if key in batch.batch.keys():

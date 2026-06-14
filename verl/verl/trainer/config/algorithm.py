@@ -349,6 +349,24 @@ class AlgoConfig(BaseConfig):
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
     grpo_outcome_weight: float = 1.0
+    sampled_token_gate_opd: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "beta": 1.0,
+            "center": 0.0,
+            "min_gate": 0.0,
+            "opd_coef": 1.0,
+        }
+    )
+    topk_token_gate_opd: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "beta": 1.0,
+            "center": 0.0,
+            "min_gate": 0.0,
+            "opd_coef": 1.0,
+        }
+    )
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

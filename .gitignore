@@ -14,7 +14,6 @@ env/
 .env
 .env.*
 !.env.example
-env.sh
 
 # Training, evaluation, and experiment outputs
 checkpoint/
@@ -22,6 +21,7 @@ logs/
 outputs/
 justrl_eval_outputs/
 wandb/
+swanlab/
 runs/
 reports/
 

@@ -874,7 +874,16 @@ def compute_token_reward_direct_advantage(
         # If rewards are 3D (batch, seq_len, k), broadcast mask to (batch, seq_len, 1)
         if token_level_rewards.dim() == 3:
             response_mask = response_mask.unsqueeze(-1)
-        advantages = token_level_rewards * response_mask
+        opd_coef = 1.0
+        if config is not None and hasattr(config, "get"):
+            sampled_gate_cfg = config.get("sampled_token_gate_opd", {}) or {}
+            if bool(sampled_gate_cfg.get("enable", False)):
+                opd_coef = float(sampled_gate_cfg.get("opd_coef", 1.0))
+            else:
+                topk_gate_cfg = config.get("topk_token_gate_opd", {}) or {}
+                if bool(topk_gate_cfg.get("enable", False)):
+                    opd_coef = float(topk_gate_cfg.get("opd_coef", 1.0))
+        advantages = token_level_rewards * response_mask * opd_coef
         returns = advantages.clone()
     
     return advantages, returns
@@ -1009,6 +1018,91 @@ def compute_token_reward_direct_grpo_gated_opd_advantage(
         }
 
     return opd_adv, opd_adv.clone(), extra_tensors
+
+
+@register_adv_est("grpo_scaled_token_gated_opd")
+def compute_grpo_scaled_token_gated_opd_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Hybrid estimator for GRPO plus gated top-k OPD.
+
+    GRPO remains the sampled-token RL branch. The OPD top-k reward is assumed
+    to have already been token-gated in compute_distillation_reward and is used
+    as a scaled auxiliary branch.
+    """
+    if token_level_rewards.dim() != 3:
+        raise ValueError("grpo_scaled_token_gated_opd requires top-k OPD rewards with shape [B, T, K]")
+    if index is None:
+        raise ValueError("grpo_scaled_token_gated_opd requires uid/index groups")
+
+    true_reward_score = kwargs.get("true_reward_score", None)
+    if true_reward_score is None:
+        raise ValueError("grpo_scaled_token_gated_opd requires true_reward_score")
+
+    cfg = {}
+    metric_prefix = "topk_gated_opd"
+    if config is not None and hasattr(config, "get"):
+        sampled_gate_cfg = config.get("sampled_token_gate_opd", {}) or {}
+        if bool(sampled_gate_cfg.get("enable", False)):
+            cfg = sampled_gate_cfg
+            metric_prefix = "sampled_gated_opd"
+        else:
+            cfg = config.get("topk_token_gate_opd", {}) or {}
+
+    opd_coef = float(cfg.get("opd_coef", 1.0))
+    grpo_coef = float(cfg.get("grpo_coef", 1.0))
+    norm_adv_by_std_in_grpo = config.norm_adv_by_std_in_grpo if config else True
+
+    with torch.no_grad():
+        response_mask_f = response_mask.to(dtype=token_level_rewards.dtype)
+        true_reward_score = true_reward_score.to(device=token_level_rewards.device)
+        if true_reward_score.dim() > 1:
+            outcome_scalar = true_reward_score.sum(dim=-1)
+            grpo_reward_tensor = true_reward_score.to(dtype=response_mask_f.dtype)
+        else:
+            outcome_scalar = true_reward_score.view(-1)
+            grpo_reward_tensor = torch.zeros_like(response_mask_f)
+            valid_lengths = response_mask_f.sum(dim=-1).long()
+            valid_response = valid_lengths > 0
+            final_pos = (valid_lengths - 1).clamp_min(0)
+            grpo_reward_tensor.scatter_(
+                dim=-1,
+                index=final_pos.unsqueeze(-1),
+                src=outcome_scalar.to(dtype=response_mask_f.dtype).unsqueeze(-1),
+            )
+            grpo_reward_tensor = torch.where(
+                valid_response.unsqueeze(-1), grpo_reward_tensor, torch.zeros_like(grpo_reward_tensor)
+            )
+
+        opd_adv = token_level_rewards * response_mask_f.unsqueeze(-1) * opd_coef
+
+        grpo_adv, _ = compute_grpo_outcome_advantage(
+            grpo_reward_tensor,
+            response_mask_f,
+            index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        grpo_adv = grpo_adv * grpo_coef
+
+        valid_lengths = response_mask_f.sum(dim=-1).clamp_min(1.0)
+        grpo_scalar_adv = (grpo_adv * response_mask_f).sum(dim=-1) / valid_lengths
+
+        extra_tensors = {
+            "grpo_advantages": grpo_adv,
+            f"{metric_prefix}_outcome_score": outcome_scalar.to(dtype=response_mask_f.dtype),
+            f"{metric_prefix}_grpo_scalar_advantage": grpo_scalar_adv,
+            f"{metric_prefix}_opd_adv_abs_mean_token": opd_adv.abs().mean(dim=-1),
+            f"{metric_prefix}_grpo_adv_abs_token": grpo_adv.abs(),
+        }
+
+    return opd_adv, opd_adv.clone(), extra_tensors
+
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.

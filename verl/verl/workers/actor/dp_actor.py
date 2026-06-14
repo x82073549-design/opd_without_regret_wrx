@@ -468,6 +468,14 @@ class DataParallelPPOActor(BasePPOActor):
         overlap_route_cfg = data.meta_info.get("overlap_route_opd", None)
         overlap_route_enabled = bool(overlap_route_cfg.get("enable", False)) if overlap_route_cfg is not None else False
         overlap_route_mode = overlap_route_cfg.get("mode", "prune_opd") if overlap_route_cfg is not None else "prune_opd"
+        topk_token_gate_cfg = data.meta_info.get("topk_token_gate_opd", None)
+        topk_token_gate_enabled = (
+            bool(topk_token_gate_cfg.get("enable", False)) if topk_token_gate_cfg is not None else False
+        )
+        sampled_token_gate_cfg = data.meta_info.get("sampled_token_gate_opd", None)
+        sampled_token_gate_enabled = (
+            bool(sampled_token_gate_cfg.get("enable", False)) if sampled_token_gate_cfg is not None else False
+        )
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -576,6 +584,108 @@ class DataParallelPPOActor(BasePPOActor):
             weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
             
             return weights
+
+        def apply_topk_token_gate(rm_scores, student_logp, teacher_logp, valid_mask):
+            if not topk_token_gate_enabled:
+                return rm_scores
+            gate_mode = topk_token_gate_cfg.get("gate_mode", "log_ratio_sigmoid")
+            gate_source = topk_token_gate_cfg.get("gate_source", "topk_gap")
+            if gate_mode != "log_ratio_sigmoid":
+                raise ValueError(f"Unsupported topk_token_gate_opd.gate_mode: {gate_mode}")
+            if gate_source != "topk_gap":
+                raise ValueError(f"Unsupported topk_token_gate_opd.gate_source: {gate_source}")
+            if student_logp is None or teacher_logp is None:
+                raise ValueError("topk_token_gate_opd requires student and teacher log probabilities")
+            if rm_scores.shape != student_logp.shape or rm_scores.shape != teacher_logp.shape:
+                raise ValueError(
+                    "topk_token_gate_opd expects rm_scores, student_logp, and teacher_logp to have the same shape"
+                )
+
+            beta = float(topk_token_gate_cfg.get("beta", 1.0))
+            center = float(topk_token_gate_cfg.get("center", 0.0))
+            min_gate = float(topk_token_gate_cfg.get("min_gate", 0.0))
+            min_gate = max(0.0, min(1.0, min_gate))
+            metric_prefix = topk_token_gate_cfg.get("metric_prefix", "topk_gate")
+            gate_valid_mask = valid_mask.bool()
+            gap = torch.where(gate_valid_mask, teacher_logp - student_logp, torch.zeros_like(student_logp))
+            gate_logits = torch.clamp(beta * (gap.float().detach() - center), min=-60.0, max=60.0)
+            raw_gate = torch.sigmoid(gate_logits).to(rm_scores.dtype)
+            gate = min_gate + (1.0 - min_gate) * raw_gate
+            gate = torch.where(gate_valid_mask, gate, torch.zeros_like(gate))
+            gated_scores = torch.where(gate_valid_mask, rm_scores * gate, torch.zeros_like(rm_scores))
+            gated_scores = torch.nan_to_num(gated_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+            gate_f = gate.float()
+            gap_f = torch.where(gate_valid_mask, gap.float(), torch.zeros_like(gap.float()))
+            res_tensors[f"{metric_prefix}_gate_mean_token"] = gate_f.mean(dim=-1).detach()
+            res_tensors[f"{metric_prefix}_gate_std_token"] = gate_f.std(dim=-1, unbiased=False).detach()
+            res_tensors[f"{metric_prefix}_gate_low_ratio_0p2_token"] = (gate_f < 0.2).float().mean(dim=-1).detach()
+            res_tensors[f"{metric_prefix}_gate_high_ratio_0p8_token"] = (gate_f > 0.8).float().mean(dim=-1).detach()
+            res_tensors[f"{metric_prefix}_gap_mean_token"] = gap_f.mean(dim=-1).detach()
+            res_tensors[f"{metric_prefix}_gap_std_token"] = gap_f.std(dim=-1, unbiased=False).detach()
+            res_tensors[f"{metric_prefix}_ungated_reward_abs_mean_token"] = rm_scores.abs().mean(dim=-1).detach()
+            res_tensors[f"{metric_prefix}_gated_reward_abs_mean_token"] = gated_scores.abs().mean(dim=-1).detach()
+            return gated_scores
+
+        def apply_sampled_token_gate(rm_scores):
+            if not sampled_token_gate_enabled:
+                return rm_scores
+            gate_mode = sampled_token_gate_cfg.get("gate_mode", "log_ratio_sigmoid")
+            if gate_mode != "log_ratio_sigmoid":
+                raise ValueError(f"Unsupported sampled_token_gate_opd.gate_mode: {gate_mode}")
+            if "teacher_response_log_probs" not in data.batch.keys():
+                raise ValueError("sampled_token_gate_opd requires teacher_response_log_probs from reward worker")
+            if "old_log_probs" not in data.batch.keys():
+                raise ValueError("sampled_token_gate_opd requires old_log_probs from actor rollout")
+
+            teacher_sampled_logp = data.batch["teacher_response_log_probs"].to(device).to(rm_scores.dtype)
+            student_sampled_logp = data.batch["old_log_probs"].to(device).to(rm_scores.dtype)
+            if teacher_sampled_logp.shape != student_sampled_logp.shape:
+                raise ValueError(
+                    "sampled_token_gate_opd expects teacher_response_log_probs and old_log_probs "
+                    "to have the same shape"
+                )
+            if rm_scores.shape[:2] != student_sampled_logp.shape:
+                raise ValueError("sampled_token_gate_opd expects rm_scores shape [B, T, K]")
+
+            if response_mask is None:
+                token_valid_mask = torch.ones_like(student_sampled_logp, dtype=torch.bool)
+            else:
+                token_valid_mask = response_mask.bool()
+
+            beta = float(sampled_token_gate_cfg.get("beta", 1.0))
+            center = float(sampled_token_gate_cfg.get("center", 0.0))
+            min_gate = float(sampled_token_gate_cfg.get("min_gate", 0.0))
+            min_gate = max(0.0, min(1.0, min_gate))
+            metric_prefix = sampled_token_gate_cfg.get("metric_prefix", "sampled_gate")
+
+            gap = torch.where(
+                token_valid_mask,
+                teacher_sampled_logp - student_sampled_logp,
+                torch.zeros_like(student_sampled_logp),
+            )
+            gate_logits = torch.clamp(beta * (gap.float().detach() - center), min=-60.0, max=60.0)
+            raw_gate = torch.sigmoid(gate_logits).to(rm_scores.dtype)
+            gate = min_gate + (1.0 - min_gate) * raw_gate
+            gate = torch.where(token_valid_mask, gate, torch.zeros_like(gate))
+
+            token_valid_mask_k = token_valid_mask.unsqueeze(-1)
+            gated_scores = rm_scores * gate.unsqueeze(-1)
+            gated_scores = torch.where(token_valid_mask_k, gated_scores, torch.zeros_like(rm_scores))
+            gated_scores = torch.nan_to_num(gated_scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+            zero_token = torch.zeros_like(gate.float())
+            ungated_abs = torch.where(token_valid_mask, rm_scores.abs().mean(dim=-1).float(), zero_token)
+            gated_abs = torch.where(token_valid_mask, gated_scores.abs().mean(dim=-1).float(), zero_token)
+            gate_f = gate.float()
+            gap_f = torch.where(token_valid_mask, gap.float(), torch.zeros_like(gap.float()))
+            res_tensors[f"{metric_prefix}_gate"] = gate_f.detach()
+            res_tensors[f"{metric_prefix}_gap"] = gap_f.detach()
+            res_tensors[f"{metric_prefix}_gate_low_ratio_0p2"] = (gate_f < 0.2).float().masked_fill(~token_valid_mask, 0.0).detach()
+            res_tensors[f"{metric_prefix}_gate_high_ratio_0p8"] = (gate_f > 0.8).float().masked_fill(~token_valid_mask, 0.0).detach()
+            res_tensors[f"{metric_prefix}_ungated_topk_opd_abs_mean_token"] = ungated_abs.detach()
+            res_tensors[f"{metric_prefix}_gated_topk_opd_abs_mean_token"] = gated_abs.detach()
+            return gated_scores
 
         res_tensors = {}
         
@@ -812,6 +922,11 @@ class DataParallelPPOActor(BasePPOActor):
                 res_tensors["overlap_route_triggered_response"] = triggered.to(rm_scores.dtype).detach()
                 res_tensors["overlap_route_first_low_pos"] = first_low_pos.detach()
 
+            if topk_token_gate_enabled:
+                rm_scores = apply_topk_token_gate(rm_scores, S_logp, T_on_S, valid_mask)
+            if sampled_token_gate_enabled:
+                rm_scores = apply_sampled_token_gate(rm_scores)
+
             if prefix_gate is not None:
                 rm_scores = rm_scores * prefix_gate.unsqueeze(-1)
             if oracle_ra_gate is not None:
@@ -860,6 +975,9 @@ class DataParallelPPOActor(BasePPOActor):
             res_tensors["union_top_k_ids"] = union_ids
             res_tensors["union_top_k_log_probs"] = S_logp_union
             res_tensors["student_log_probs_on_teacher_ids"] = S_on_T
+
+            if topk_token_gate_enabled:
+                rm_scores = apply_topk_token_gate(rm_scores, S_logp_union, T_logp_union, valid_mask)
 
             if overlap_route_enabled:
                 if overlap_route_mode not in ["prune_opd_event_fkl", "union_rkl_teacher_fkl_switch"]:

@@ -14,6 +14,15 @@
 
 set -x
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+cd "$ROOT_DIR"
+
+if [ -f "$ROOT_DIR/env.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$ROOT_DIR/env.sh"
+fi
+
 if [ -z "$SLURM_JOB_ID" ]; then
     LOG_DIR=${LOG_DIR:-logs}
     mkdir -p "$LOG_DIR"

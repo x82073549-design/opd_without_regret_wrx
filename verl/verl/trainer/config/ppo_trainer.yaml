@@ -83,6 +83,22 @@ algorithm:
   # Weight for GRPO outcome advantage in hybrid estimator
   grpo_outcome_weight: 1.0
 
+  # Sampled-token gate for modulating top-k OPD rewards
+  sampled_token_gate_opd:
+    enable: False
+    beta: 1.0
+    center: 0.0
+    min_gate: 0.0
+    opd_coef: 1.0
+
+  # Top-k-token gate for modulating each top-k OPD candidate reward
+  topk_token_gate_opd:
+    enable: False
+    beta: 1.0
+    center: 0.0
+    min_gate: 0.0
+    opd_coef: 1.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 

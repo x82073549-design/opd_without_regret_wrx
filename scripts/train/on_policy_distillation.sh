@@ -14,6 +14,15 @@
 
 set -x
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+cd "$ROOT_DIR"
+
+if [ -f "$ROOT_DIR/env.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$ROOT_DIR/env.sh"
+fi
+
 # Configure logging when running outside SBATCH.
 if [ -z "$SLURM_JOB_ID" ]; then
     # Create the log directory and file for local runs.
@@ -33,15 +42,15 @@ export RAY_memory_usage_threshold=0.99
 export CUDA_LAUNCH_BLOCKING=1
 # export CUDA_VISIBLE_DEVICES=1,2,3,4
 export PYTHONUNBUFFERED=1
-export PROJECT_NAME='OnPolicyDistillation' # TODO
+export PROJECT_NAME=${PROJECT_NAME:-OnPolicyDistillation}
 export TORCH_NCCL_BLOCKING_WAIT=1
 export NCCL_TIMEOUT=7200
 export TORCH_DISTRIBUTED_DEBUG=INFO
-export ADV_ESTIMATOR=token_reward_direct
+export ADV_ESTIMATOR=${ADV_ESTIMATOR:-token_reward_direct}
 # export ADV_ESTIMATOR=token_reward_direct_plus_grpo
 # export ADV_ESTIMATOR=token_grpo
 # export ADV_ESTIMATOR=grpo
-export GRPO_OUTCOME_WEIGHT=1.0
+export GRPO_OUTCOME_WEIGHT=${GRPO_OUTCOME_WEIGHT:-1.0}
 # export ADV_ESTIMATOR=token_grpo
 # Swanlab setting used to continue exp  
 # export SWANLAB_RESUME=must
@@ -79,6 +88,20 @@ export OVERLAP_ROUTE_TRIGGER=${OVERLAP_ROUTE_TRIGGER:-first_low}
 export OVERLAP_ROUTE_WDROP=${OVERLAP_ROUTE_WDROP:-0.01}
 export OVERLAP_ROUTE_WBASE=${OVERLAP_ROUTE_WBASE:-0.5}
 export OVERLAP_ROUTE_FKL_COEF=${OVERLAP_ROUTE_FKL_COEF:-0.1}
+export SAMPLED_TOKEN_GATE_OPD_ENABLE=${SAMPLED_TOKEN_GATE_OPD_ENABLE:-False}
+export SAMPLED_TOKEN_GATE_OPD_BETA=${SAMPLED_TOKEN_GATE_OPD_BETA:-1.0}
+export SAMPLED_TOKEN_GATE_OPD_CENTER=${SAMPLED_TOKEN_GATE_OPD_CENTER:-0.0}
+export SAMPLED_TOKEN_GATE_OPD_MIN_GATE=${SAMPLED_TOKEN_GATE_OPD_MIN_GATE:-0.0}
+export SAMPLED_TOKEN_GATE_OPD_OPD_COEF=${SAMPLED_TOKEN_GATE_OPD_OPD_COEF:-1.0}
+export TOPK_TOKEN_GATE_OPD_ENABLE=${TOPK_TOKEN_GATE_OPD_ENABLE:-False}
+export TOPK_TOKEN_GATE_OPD_BETA=${TOPK_TOKEN_GATE_OPD_BETA:-1.0}
+export TOPK_TOKEN_GATE_OPD_CENTER=${TOPK_TOKEN_GATE_OPD_CENTER:-0.0}
+export TOPK_TOKEN_GATE_OPD_MIN_GATE=${TOPK_TOKEN_GATE_OPD_MIN_GATE:-0.0}
+export TOPK_TOKEN_GATE_OPD_OPD_COEF=${TOPK_TOKEN_GATE_OPD_OPD_COEF:-1.0}
+export OUTCOME_OPD_MASK_ENABLE=${OUTCOME_OPD_MASK_ENABLE:-False}
+export OUTCOME_OPD_MASK_CORRECT_THRESHOLD=${OUTCOME_OPD_MASK_CORRECT_THRESHOLD:-0.5}
+export OUTCOME_OPD_MASK_WRONG_PREFIX_RATIO=${OUTCOME_OPD_MASK_WRONG_PREFIX_RATIO:-0.25}
+export OUTCOME_OPD_MASK_MIN_PREFIX_TOKENS=${OUTCOME_OPD_MASK_MIN_PREFIX_TOKENS:-1}
 
 # TODO: qwen3_1p7b_base / qwen3_1p7b / llama31_8b_base / llama31_8b_inst / qwen3_8b_base / qwen3_8b / qwen25_1p5b_base / qwen25_1p5b_inst / qwen25_7b_base / qwen25_7b_inst / qwen25_math_7b_base / qwen25_math_7b_inst / qwen25_math_1p5b_base / qwen25_math_1p5b_inst / distill_r1_1p5b / olmo2_1124_7b_base / olmo2_1124_7b_sft / olmo2_1124_7b_inst / llama32_3b_inst
 # export EXPERIMENT_NAME=grpo_${TASK}_llama31_tulu3_8b_sft_8k-T_${TEMPERATURE}-n_${N_RESPONSES}-kl_${USE_KL}-mbs_${MINI_BATCH_SIZE}-${REWARD_TYPE}-$(date +%Y-%m-%d_%H-%M-%S)
@@ -117,7 +140,7 @@ TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME25/test.parquet", "$TEST_DATA_DIR
 # export ACTOR_MODEL_PATH=/workspace/model/Qwen3-1.7B-SFT-DAPO-4B-RL
 # export ACTOR_MODEL_PATH=/workspace/model/Qwen3-1.7B-SFT-DAPO-4B
 # export ACTOR_MODEL_PATH=model/Qwen2.5-Math-1.5B
-export ACTOR_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-1.5B
+export ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-model/DeepSeek-R1-Distill-Qwen-1.5B}
 # export ACTOR_MODEL_PATH=model/JustRL-DeepSeek-1.5B-step_0400
 # export ACTOR_MODEL_PATH=model/JustRL-DeepSeek-1.5B
 # export ACTOR_MODEL_PATH=model/Qwen3-1.7B-SFT
@@ -138,7 +161,7 @@ export ACTOR_MODEL_NAME=$(basename "$ACTOR_MODEL_PATH")
 # export REWARD_MODEL_PATH=model/Skywork-OR1-Math-7B
 # export REWARD_MODEL_PATH=model/Polaris-4B-Preview
 # export REWARD_MODEL_PATH=model/DeepSeek-R1-Distill-Qwen-14B
-export REWARD_MODEL_PATH=model/JustRL-DeepSeek-1.5B
+export REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-model/JustRL-DeepSeek-1.5B}
 export REWARD_MODEL_NAME=$(basename "$REWARD_MODEL_PATH")
 
 export PROJECT_PATH=checkpoint
@@ -184,6 +207,9 @@ echo "  MINI_BATCH_SIZE=$MINI_BATCH_SIZE"
 echo "  TOP_K_STRATEGY=$TOP_K_STRATEGY"
 echo "  OVERLAP_ROUTE_OPD_ENABLE=$OVERLAP_ROUTE_OPD_ENABLE"
 echo "  OVERLAP_ROUTE_MODE=$OVERLAP_ROUTE_MODE"
+echo "  SAMPLED_TOKEN_GATE_OPD_ENABLE=$SAMPLED_TOKEN_GATE_OPD_ENABLE"
+echo "  TOPK_TOKEN_GATE_OPD_ENABLE=$TOPK_TOKEN_GATE_OPD_ENABLE"
+echo "  OUTCOME_OPD_MASK_ENABLE=$OUTCOME_OPD_MASK_ENABLE"
 echo "  CKPT_PATH=$CKPT_PATH"
 echo "  EXPERIMENT_NAME=$EXPERIMENT_NAME"
 echo "  RESUME_MODE=$RESUME_MODE"
@@ -226,6 +252,32 @@ if [ "$OVERLAP_ROUTE_OPD_ENABLE" = "True" ]; then
     +algorithm.overlap_route_opd.fkl_coef=$OVERLAP_ROUTE_FKL_COEF"
 fi
 
+SAMPLED_TOKEN_GATE_ARGS=""
+if [ "$SAMPLED_TOKEN_GATE_OPD_ENABLE" = "True" ]; then
+    SAMPLED_TOKEN_GATE_ARGS="algorithm.sampled_token_gate_opd.enable=True \
+    algorithm.sampled_token_gate_opd.beta=$SAMPLED_TOKEN_GATE_OPD_BETA \
+    algorithm.sampled_token_gate_opd.center=$SAMPLED_TOKEN_GATE_OPD_CENTER \
+    algorithm.sampled_token_gate_opd.min_gate=$SAMPLED_TOKEN_GATE_OPD_MIN_GATE \
+    algorithm.sampled_token_gate_opd.opd_coef=$SAMPLED_TOKEN_GATE_OPD_OPD_COEF"
+fi
+
+TOPK_TOKEN_GATE_ARGS=""
+if [ "$TOPK_TOKEN_GATE_OPD_ENABLE" = "True" ]; then
+    TOPK_TOKEN_GATE_ARGS="algorithm.topk_token_gate_opd.enable=True \
+    algorithm.topk_token_gate_opd.beta=$TOPK_TOKEN_GATE_OPD_BETA \
+    algorithm.topk_token_gate_opd.center=$TOPK_TOKEN_GATE_OPD_CENTER \
+    algorithm.topk_token_gate_opd.min_gate=$TOPK_TOKEN_GATE_OPD_MIN_GATE \
+    algorithm.topk_token_gate_opd.opd_coef=$TOPK_TOKEN_GATE_OPD_OPD_COEF"
+fi
+
+OUTCOME_OPD_MASK_ARGS=""
+if [ "$OUTCOME_OPD_MASK_ENABLE" = "True" ]; then
+    OUTCOME_OPD_MASK_ARGS="+algorithm.outcome_opd_mask.enable=True \
+    +algorithm.outcome_opd_mask.correct_threshold=$OUTCOME_OPD_MASK_CORRECT_THRESHOLD \
+    +algorithm.outcome_opd_mask.wrong_prefix_ratio=$OUTCOME_OPD_MASK_WRONG_PREFIX_RATIO \
+    +algorithm.outcome_opd_mask.min_prefix_tokens=$OUTCOME_OPD_MASK_MIN_PREFIX_TOKENS"
+fi
+
 PPO_MAX_TOKEN_LEN_PER_GPU=$(( ((1024 + MAX_RESP_LENGTH) > 32768) ? (1024 + MAX_RESP_LENGTH) : 32768))
 echo "PPO_MAX_TOKEN_LEN_PER_GPU: $PPO_MAX_TOKEN_LEN_PER_GPU"
 
@@ -238,6 +290,9 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$ADV_ESTIMATOR \
     algorithm.grpo_outcome_weight=$GRPO_OUTCOME_WEIGHT \
     $OVERLAP_ROUTE_ARGS \
+    $SAMPLED_TOKEN_GATE_ARGS \
+    $TOPK_TOKEN_GATE_ARGS \
+    $OUTCOME_OPD_MASK_ARGS \
     data.shuffle=False \
     data.train_files="$TRAIN_DATASET" \
     data.val_files="$TEST_DATASET" \

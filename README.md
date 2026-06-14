@@ -41,9 +41,50 @@ Finally, we show that OPD's apparent free lunch of dense token-level reward come
 
 ## ✨Getting Started
 
+### Quick OPD Start
+
+The fastest path is to treat this repository as an OPD experiment package: create the runtime, point it at the student model, teacher model, and math datasets, then run a one-step smoke test before launching a full job.
+
+```bash
+conda env create -f environment.yml
+conda activate verl-opd
+source env.sh
+
+cp .env.example .env
+# Edit .env if your models, datasets, or GPU IDs live elsewhere.
+source .env
+
+bash scripts/check_setup.sh
+TRAIN_TOTAL_STEPS=1 bash scripts/train/opd_2gpu_80g.sh
+```
+
+After the smoke test passes, launch OPD with one of the provided entrypoints:
+
+```bash
+# 2 x 80G GPUs, recommended first run
+bash scripts/train/opd_2gpu_80g.sh
+
+# 8 x A800 80G GPUs, paper-scale default
+bash scripts/train/on_policy_distillation.sh
+```
+
+Evaluate a checkpoint after training:
+
+```bash
+CKPT=checkpoint/<exp>/global_step_<step>/actor bash scripts/val/eval_opd.sh
+```
+
 ### Environment Setup
 
-Our code is mainly based on [verl](https://github.com/verl-project/verl) (v0.7.0). To prepare the environment used for OPD and RL:
+OPD/RL training is built on the vendored [verl](https://github.com/verl-project/verl) backend. The recommended setup is:
+
+```bash
+conda env create -f environment.yml
+conda activate verl-opd
+source env.sh
+```
+
+If you prefer a manual setup, use the same package versions:
 
 ```bash
 conda create -n verl-opd -y -c conda-forge python=3.12 pytorch=2.8.0=*cuda129* cudnn=9.10.2.21 pip
@@ -53,23 +94,61 @@ pip install -r requirements.txt
 source env.sh
 ```
 
-And we use [LlamaFactory](https://github.com/hiyouga/LLaMA-Factory) (v0.9.5) for SFT training. To prepare the environment for SFT:
+### Model and Data Layout
 
-```bash
-conda create -n sft python==3.11
-cd LlamaFactory/
-pip install -e .
-pip install -r requirements/metrics.txt
+The default OPD scripts expect the following paths. These can be real directories or symlinks.
+
+```text
+model/
+  DeepSeek-R1-Distill-Qwen-1.5B/
+  JustRL-DeepSeek-1.5B/
+
+datasets/
+  dapo-math-17k.parquet
+  test_data/
+    AIME24/test.parquet
+    AIME25/test.parquet
+    AMC23/test.parquet
 ```
 
-### Training
-
-#### OPD
-
-Use the following command to start on-policy distillation:
+You can override the paths by copying and editing `.env.example`:
 
 ```bash
-bash on_policy_distillation.sh
+cp .env.example .env
+source .env
+```
+
+The setup checker verifies the runtime imports, visible GPUs, model paths, and dataset paths:
+
+```bash
+bash scripts/check_setup.sh
+```
+
+### OPD Training
+
+Use `scripts/train/opd_2gpu_80g.sh` for the smallest ready-to-run OPD entrypoint, and `scripts/train/on_policy_distillation.sh` for the original 8-GPU configuration.
+
+```bash
+# One-step smoke test
+TRAIN_TOTAL_STEPS=1 bash scripts/train/opd_2gpu_80g.sh
+
+# Full 2-GPU OPD run
+bash scripts/train/opd_2gpu_80g.sh
+
+# Full 8-GPU OPD run
+bash scripts/train/on_policy_distillation.sh
+```
+
+Additional gated-OPD experiment entrypoints live in the same directory:
+
+```bash
+# Sampled-token gate times top-k OPD
+bash scripts/train/sampled_gated_opd.sh
+bash scripts/train/grpo_sampled_gated_opd.sh
+
+# Top-k-token gate times top-k OPD
+bash scripts/train/topk_gated_opd.sh
+bash scripts/train/grpo_topk_gated_opd.sh
 ```
 
 <details>
@@ -101,7 +180,16 @@ bash on_policy_distillation.sh
 > [!NOTE]
 > You can use `scripts/infer/dedup_deepmath.py` to deduplicate DeepMath against DAPO-Math-17K and avoid data overlap, as the experiments shown in Section 5.2 in our paper.
 
-#### SFT
+### SFT
+
+We use [LlamaFactory](https://github.com/hiyouga/LLaMA-Factory) (v0.9.5) for SFT training. To prepare the environment for SFT:
+
+```bash
+conda create -n sft python==3.11
+cd LlamaFactory/
+pip install -e .
+pip install -r requirements/metrics.txt
+```
 
 Use `scripts/infer/vllm_rollout.py` to rollout teacher responses that will later be used for student SFT.
 
@@ -141,7 +229,7 @@ The SFT dataset used by this config is released as [OpenThought3-Qwen3-4B](https
 
 We release the resulting SFT checkpoint [Qwen3-1.7B-SFT](https://huggingface.co/lllyx/Qwen3-1.7B-SFT), which is obtained by supervised fine-tuning from `Qwen3-1.7B-Base`.
 
-#### RL (GRPO)
+### RL (GRPO)
 
 We use GRPO as the RL algorithm. To enable RL, set `ADV_ESTIMATOR=grpo` and `LOG_PROB_TOP_K=0`. A reference script `grpo.sh` is provided.
 
@@ -152,16 +240,30 @@ We release the resulting RL checkpoint [Qwen3-4B-Base-GRPO](https://huggingface.
 
 ### Validation
 
-We reuse the evaluation pipeline from [JustRL](https://github.com/thunlp/JustRL).
+The recommended OPD checkpoint evaluation entrypoint merges the FSDP actor checkpoint and runs generation plus grading:
 
-**Generation (Optional)**
+```bash
+CKPT=checkpoint/<exp>/global_step_<step>/actor bash scripts/val/eval_opd.sh
+```
+
+Common overrides:
+
+```bash
+GPU_IDS=0,1 N=16 MAX_TOKENS=31744 CKPT=checkpoint/<exp>/global_step_<step>/actor bash scripts/val/eval_opd.sh
+```
+
+Results are written to `justrl_eval_outputs/<merged_model_name>/grading_results.json`.
+
+Under the hood, we reuse the evaluation pipeline from [JustRL](https://github.com/thunlp/JustRL). You can also run generation and grading manually.
+
+**Generation**
 
 ```bash
 cd scripts/val/eval
 python gen_vllm.py
 ```
 
-Before running generation, set `MODEL_NAMES` in `gen_vllm.py` to the checkpoint(s) you want to evaluate. And set appropriate `available_workers`.
+Before running generation, set `MODEL_NAMES` in `gen_vllm.py` to the checkpoint(s) you want to evaluate and set appropriate `available_workers`.
 
 **Grading**
 

@@ -3066,6 +3066,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         is_plot = data.meta_info.get("is_plot", False)
         ratio_kl_switch_cfg = data.meta_info.get("ratio_kl_switch", None)
         ratio_kl_switch_enabled = bool(ratio_kl_switch_cfg.get("enable", False)) if ratio_kl_switch_cfg is not None else False
+        sampled_token_gate_cfg = data.meta_info.get("sampled_token_gate_opd", None)
+        sampled_token_gate_enabled = (
+            bool(sampled_token_gate_cfg.get("enable", False)) if sampled_token_gate_cfg is not None else False
+        )
         # Compute teacher entropy every step for logging, but only plot every 10 steps
         compute_entropy = True
 
@@ -3224,7 +3228,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             if rm_scores is not None:
                 tensors["rm_scores"] = rm_scores
 
-            if ratio_kl_switch_enabled:
+            if ratio_kl_switch_enabled or sampled_token_gate_enabled:
                 tensors["teacher_response_log_probs"] = teacher_logp
             
             if teacher_on_student_logp is not None:

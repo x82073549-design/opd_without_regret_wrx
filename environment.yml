@@ -1,0 +1,12 @@
+name: verl-opd
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pytorch=2.8.0=*cuda129*
+  - cudnn=9.10.2.21
+  - cuda-toolkit=12.9
+  - pip
+  - pip:
+      - -r requirements.txt
