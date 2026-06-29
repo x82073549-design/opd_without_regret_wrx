@@ -1,0 +1,25 @@
+# Local training artifacts
+checkpoint/
+checkpoints/
+outputs/
+validation_log/
+wandb/
+
+# Generated validation data
+scripts/val/data_verl/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and temporary files
+*.log
+*.lock
+.DS_Store
+*.swp

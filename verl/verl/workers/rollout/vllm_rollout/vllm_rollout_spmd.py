@@ -365,17 +365,9 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
-                "best_of": 1,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0,
-                "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
-        elif is_validate:
-            # Get max_tokens from val_kwargs, use response_length as fallback if None
+        if is_validate:
+            # Validation must honor val_kwargs.max_tokens even for greedy decoding.
+            # Checking `not do_sample` first silently falls back to training response_length.
             val_max_tokens = self.config.val_kwargs.get("max_tokens", self.config.response_length)
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
@@ -384,10 +376,29 @@ class vLLMRollout(BaseRollout):
                 "max_tokens": val_max_tokens,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+            if not do_sample:
+                kwargs.update(
+                    {
+                        "best_of": 1,
+                        "top_p": 1.0,
+                        "top_k": -1,
+                        "min_p": 0.0,
+                        "temperature": 0,
+                    }
+                )
             # Note: repetition_penalty is not in val_kwargs, will use the value from self.sampling_params (training value)
             validation_repetition_penalty = getattr(self.sampling_params, "repetition_penalty", 1.0)
             print(f"[vLLM Rollout] Validation mode - repetition_penalty (from training config): {validation_repetition_penalty}")
             print(f"Validation kwargs: {kwargs}")
+        elif not do_sample:
+            kwargs = {
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
+            }
         
             
 

@@ -178,6 +178,152 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _config_get(config, key, default=None):
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _config_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.lower() == "true"
+    return bool(value)
+
+
+def compute_token_feature_weights(
+    feature_values: torch.Tensor,
+    response_mask: torch.Tensor,
+    alpha: float,
+    direction: str,
+    eps: float = 1e-6,
+    min_weight: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute per-sequence mean-one token weights for a scalar token feature."""
+    if feature_values.dim() != 2:
+        raise ValueError(f"feature_values must be 2D (batch, response_length), got {feature_values.shape}")
+    if response_mask.shape != feature_values.shape:
+        raise ValueError(f"response_mask shape {response_mask.shape} must match feature_values shape {feature_values.shape}")
+
+    direction_to_sign = {"normal": 1.0, "reverse": -1.0, "uniform": 0.0}
+    if direction not in direction_to_sign:
+        raise ValueError(f"Unknown token feature weighting direction: {direction}")
+
+    feature_values = feature_values.float()
+    mask = response_mask.to(device=feature_values.device, dtype=feature_values.dtype)
+    mask_bool = mask > 0
+    valid_count = mask.sum(dim=-1, keepdim=True)
+    safe_count = valid_count.clamp_min(1.0)
+
+    masked_features = torch.where(mask_bool, feature_values, torch.zeros_like(feature_values))
+    seq_mean = masked_features.sum(dim=-1, keepdim=True) / safe_count
+    centered = torch.where(mask_bool, feature_values - seq_mean, torch.zeros_like(feature_values))
+    seq_var = (centered.square() * mask).sum(dim=-1, keepdim=True) / safe_count
+    seq_std = torch.sqrt(seq_var.clamp_min(0.0))
+    z = torch.where((seq_std > eps) & (valid_count > 0), centered / seq_std.clamp_min(eps), torch.zeros_like(centered))
+
+    signed_alpha = float(alpha) * direction_to_sign[direction]
+    perturb = torch.tanh(0.5 * signed_alpha * z)
+    perturb = torch.where(mask_bool, perturb, torch.zeros_like(perturb))
+    perturb_mean = (perturb * mask).sum(dim=-1, keepdim=True) / safe_count
+
+    weights = 1.0 + perturb - perturb_mean
+    weights = torch.where(mask_bool, weights, torch.ones_like(weights))
+
+    clipped_mask = (weights < float(min_weight)) & mask_bool
+    if min_weight is not None:
+        weights = torch.where(clipped_mask, torch.full_like(weights, float(min_weight)), weights)
+        seq_weight_mean = (weights * mask).sum(dim=-1, keepdim=True) / safe_count
+        renorm_weights = torch.where(seq_weight_mean > eps, weights / seq_weight_mean.clamp_min(eps), torch.ones_like(weights))
+        weights = torch.where(mask_bool, renorm_weights, torch.ones_like(weights))
+
+    total_valid = mask.sum().clamp_min(1.0)
+    feature_mean = (feature_values * mask).sum() / total_valid
+    feature_var = (((feature_values - feature_mean) * mask).square().sum()) / total_valid
+    weight_mean = (weights * mask).sum() / total_valid
+    clipped_frac = clipped_mask.float().sum() / total_valid
+    valid_weight_min = torch.where(mask_bool, weights, torch.full_like(weights, float("inf"))).min()
+    valid_weight_max = torch.where(mask_bool, weights, torch.full_like(weights, -float("inf"))).max()
+    valid_weight_min = torch.where(mask.sum() > 0, valid_weight_min, torch.tensor(1.0, device=feature_values.device))
+    valid_weight_max = torch.where(mask.sum() > 0, valid_weight_max, torch.tensor(1.0, device=feature_values.device))
+    diagnostics = {
+        "feature_mean": feature_mean,
+        "feature_std": torch.sqrt(feature_var.clamp_min(0.0)),
+        "weight_mean": weight_mean,
+        "weight_min": valid_weight_min,
+        "weight_max": valid_weight_max,
+        "clipped_frac": clipped_frac,
+        "alpha": torch.tensor(float(alpha), device=feature_values.device),
+        "direction_id": torch.tensor(direction_to_sign[direction], device=feature_values.device),
+    }
+    return weights, diagnostics
+
+
+def _get_token_feature_values(data: DataProto, feature: str) -> torch.Tensor:
+    if feature != "teacher_confidence":
+        raise ValueError(f"Unsupported token feature weighting feature: {feature}")
+    if "teacher_top_k_log_probs" not in data.batch.keys():
+        raise ValueError("teacher_confidence weighting requires teacher_top_k_log_probs; set LOG_PROB_TOP_K > 0.")
+
+    teacher_top_k_log_probs = data.batch["teacher_top_k_log_probs"]
+    if teacher_top_k_log_probs.dim() != 3 or teacher_top_k_log_probs.shape[-1] < 1:
+        raise ValueError(
+            "teacher_top_k_log_probs must have shape (batch, response_length, top_k) with top_k >= 1 "
+            f"for teacher_confidence weighting, got {teacher_top_k_log_probs.shape}."
+        )
+    return torch.exp(teacher_top_k_log_probs[..., 0])
+
+
+def apply_token_feature_weighting(
+    data: DataProto,
+    config,
+) -> tuple[DataProto, dict[str, float]]:
+    if config is None or not _config_bool(_config_get(config, "enable", False)):
+        return data, {}
+    if "token_level_rewards" not in data.batch.keys():
+        raise ValueError("token feature weighting requires token_level_rewards in the batch.")
+    if "response_mask" not in data.batch.keys():
+        data.batch["response_mask"] = compute_response_mask(data)
+
+    feature = _config_get(config, "feature", "teacher_confidence")
+    alpha = float(_config_get(config, "alpha", 0.0))
+    direction = _config_get(config, "direction", "uniform")
+    eps = float(_config_get(config, "eps", 1e-6))
+    min_weight = float(_config_get(config, "min_weight", 0.0))
+
+    feature_values = _get_token_feature_values(data, feature)
+    weights, diagnostics = compute_token_feature_weights(
+        feature_values=feature_values,
+        response_mask=data.batch["response_mask"],
+        alpha=alpha,
+        direction=direction,
+        eps=eps,
+        min_weight=min_weight,
+    )
+
+    rewards = data.batch["token_level_rewards"]
+    reward_weights = weights.to(device=rewards.device, dtype=rewards.dtype)
+    if rewards.dim() == 3:
+        reward_weights = reward_weights.unsqueeze(-1)
+    elif rewards.dim() != 2:
+        raise ValueError(f"token_level_rewards must be 2D or 3D for token feature weighting, got {rewards.shape}")
+    data.batch["token_level_rewards"] = rewards * reward_weights
+
+    metric_name_prefix = f"token_feature/{feature}"
+    metrics = {
+        f"{metric_name_prefix}_mean": diagnostics["feature_mean"].detach().item(),
+        f"{metric_name_prefix}_std": diagnostics["feature_std"].detach().item(),
+        "token_feature/weight_mean": diagnostics["weight_mean"].detach().item(),
+        "token_feature/weight_min": diagnostics["weight_min"].detach().item(),
+        "token_feature/weight_max": diagnostics["weight_max"].detach().item(),
+        "token_feature/clipped_frac": diagnostics["clipped_frac"].detach().item(),
+        "token_feature/alpha": diagnostics["alpha"].detach().item(),
+        "token_feature/direction_id": diagnostics["direction_id"].detach().item(),
+    }
+    return data, metrics
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -1371,6 +1517,10 @@ class RayPPOTrainer:
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
+
+                        token_feature_config = self.config.algorithm.get("token_feature_weighting", None)
+                        batch, token_feature_metrics = apply_token_feature_weighting(batch, token_feature_config)
+                        metrics.update(token_feature_metrics)
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
