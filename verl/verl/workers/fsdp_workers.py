@@ -2380,30 +2380,43 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         """Re-tokenize with the RM's chat template while preserving token-level alignment.
 
         Unlike _switch_chat_template (which uses right-padding for sequence-level RM),
-        this function uses LEFT-padding so that the response stays at the end of the
-        sequence. This ensures that `[-response_length-1:-1]` correctly targets the
-        response positions for token-level distillation (student_top_k_ids alignment).
+        this function preserves the original fixed [prompt][response] block layout:
+        the re-templated RM prompt is left-padded to the original prompt length, and
+        the original response tokens remain right-padded in the response block. This
+        ensures that `[-response_length-1:-1]` correctly targets the response
+        positions for token-level distillation (student_top_k_ids alignment).
 
         Requirements: actor and reward model must share the same vocabulary.
         """
-        src_max_length = data.batch["attention_mask"].shape[-1]
+        src_seq_length = data.batch["attention_mask"].shape[-1]
+        response_length = data.batch["responses"].shape[-1]
+        prompt_length = src_seq_length - response_length
 
         src_tokenizer = self.input_tokenizer
         target_tokenizer = self.tokenizer
 
-        is_debug = (self.rank == 0)  # only print on rank 0
+        if prompt_length <= 0:
+            raise ValueError(
+                f"Cannot switch chat template with non-positive prompt_length={prompt_length}; "
+                f"src_seq_length={src_seq_length}, response_length={response_length}."
+            )
 
-        if is_debug:
-            print(f"\n{'='*80}")
-            print(f"[DEBUG _switch_chat_template_token_level] START")
-            print(f"  src_tokenizer: {type(src_tokenizer).__name__}, vocab_size={src_tokenizer.vocab_size}")
-            print(f"  target_tokenizer: {type(target_tokenizer).__name__}, vocab_size={target_tokenizer.vocab_size}")
-            print(f"  src_max_length={src_max_length}")
-            print(f"  batch_size={data.batch.batch_size[0]}")
-            print(f"  original input_ids shape: {data.batch['input_ids'].shape}")
-            print(f"  original attention_mask shape: {data.batch['attention_mask'].shape}")
-            print(f"  original responses shape: {data.batch['responses'].shape}")
-            print(f"{'='*80}")
+        pad_token_id = target_tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = src_tokenizer.pad_token_id
+        if pad_token_id is None:
+            raise ValueError("Token-level chat-template switching requires a pad_token_id.")
+
+        if not getattr(self, "_token_level_switch_vocab_checked", False):
+            if src_tokenizer.get_vocab() != target_tokenizer.get_vocab():
+                raise ValueError(
+                    "Token-level chat-template switching requires actor and reward tokenizers "
+                    "to have identical token-to-id vocabularies, otherwise response token "
+                    "log-probabilities can be misaligned."
+                )
+            self._token_level_switch_vocab_checked = True
+
+        is_debug = bool(self.config.get("debug_switch_chat_template", False)) and self.rank == 0
 
         rm_input_ids = []
         rm_attention_mask = []
@@ -2420,111 +2433,51 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
             # extract response
             response_ids = data.batch["responses"][i]
-            response_length = response_ids.shape[-1]
-            valid_response_length = data.batch["attention_mask"][i][-response_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode using the actor's tokenizer
-            response = src_tokenizer.decode(valid_response_ids)
-            # remove bos and eos
-            if src_tokenizer.eos_token:
-                response = response.replace(src_tokenizer.eos_token, "")
-
-            if is_debug and i == 0:
-                print(f"\n[DEBUG sample 0] --- Response decode/re-encode ---")
-                print(f"  original response_ids shape: {response_ids.shape}")
-                print(f"  response_length (padded): {response_length}")
-                print(f"  valid_response_length: {valid_response_length}")
-                print(f"  original response_ids (first 20): {valid_response_ids[:20].tolist()}")
-                print(f"  decoded response (first 200 chars): {response[:200]}")
-
-            chat.append({"role": "assistant", "content": response})
+            valid_response_length = int(data.batch["attention_mask"][i][-response_length:].sum().item())
+            valid_response_ids = response_ids[:valid_response_length].detach().cpu().to(torch.long)
 
             prompt_with_chat_template = target_tokenizer.apply_chat_template(
-                chat, add_generation_prompt=False, tokenize=False
+                chat, add_generation_prompt=True, tokenize=False
             )
 
             if is_debug and i == 0:
-                print(f"  chat template applied (first 300 chars): {prompt_with_chat_template[:300]}")
-                print(f"  chat template applied (last 200 chars): {prompt_with_chat_template[-200:]}")
-
-            max_length = self.config.get("max_length", src_max_length)
-            if max_length is None:
-                max_length = src_max_length
+                print(f"\n{'='*80}")
+                print("[DEBUG _switch_chat_template_token_level] START")
+                print(f"  src_seq_length={src_seq_length}")
+                print(f"  prompt_length={prompt_length}")
+                print(f"  response_length={response_length}")
+                print(f"  valid_response_length={valid_response_length}")
+                print(f"  teacher prompt tail: {prompt_with_chat_template[-200:]}")
+                print(f"{'='*80}")
 
             model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors="pt", add_special_tokens=False)
 
-            if is_debug and i == 0:
-                raw_len = model_inputs["input_ids"].shape[-1]
-                print(f"  re-tokenized length (before pad/trunc): {raw_len}")
-                print(f"  max_length for postprocess: {max_length}")
-
-            input_ids, attention_mask = verl_F.postprocess_data(
+            prompt_input_ids, prompt_attention_mask = verl_F.postprocess_data(
                 input_ids=model_inputs["input_ids"],
                 attention_mask=model_inputs["attention_mask"],
-                max_length=max_length,
-                pad_token_id=target_tokenizer.pad_token_id,
-                left_pad=True,  # LEFT padding to keep response at end
+                max_length=prompt_length,
+                pad_token_id=pad_token_id,
+                left_pad=True,
                 truncation=self.config.get("truncation", "left"),  # truncate prompt from left if needed
             )
 
-            if is_debug and i == 0:
-                content_len = attention_mask.sum().item()
-                pad_len = max_length - content_len
-                # find where content starts (first non-pad position)
-                first_content_pos = (attention_mask.squeeze(0) == 1).nonzero(as_tuple=True)[0]
-                first_pos = first_content_pos[0].item() if len(first_content_pos) > 0 else -1
-                last_pos = first_content_pos[-1].item() if len(first_content_pos) > 0 else -1
-                print(f"  after postprocess: input_ids shape={input_ids.shape}")
-                print(f"  content_len={content_len}, pad_len={pad_len}")
-                print(f"  content range: [{first_pos}, {last_pos}]")
-                print(f"  last 10 input_ids: {input_ids.squeeze(0)[-10:].tolist()}")
-                print(f"  last 10 attn_mask: {attention_mask.squeeze(0)[-10:].tolist()}")
-
-            rm_input_ids.append(input_ids)
-            rm_attention_mask.append(attention_mask)
-
-            # Re-tokenize the response alone with the target tokenizer to get correct response_ids
-            response_inputs = target_tokenizer(response, return_tensors="pt", add_special_tokens=False)
-            new_response_ids = response_inputs["input_ids"].squeeze(0)  # (new_resp_len,)
+            response_block = torch.full((response_length,), pad_token_id, dtype=torch.long)
+            response_attention_mask = torch.zeros((response_length,), dtype=prompt_attention_mask.dtype)
+            if valid_response_length > 0:
+                response_block[:valid_response_length] = valid_response_ids
+                response_attention_mask[:valid_response_length] = 1
 
             if is_debug and i == 0:
-                print(f"\n[DEBUG sample 0] --- Response re-tokenization ---")
-                print(f"  new_response_ids length: {new_response_ids.shape[0]}")
-                print(f"  original valid_response_length: {valid_response_length}")
-                print(f"  target response_length (padded): {response_length}")
-                print(f"  new_response_ids (first 20): {new_response_ids[:20].tolist()}")
-                print(f"  orig valid_response_ids (first 20): {valid_response_ids[:20].tolist()}")
-                # Check token-by-token match
-                min_len = min(new_response_ids.shape[0], valid_response_ids.shape[0])
-                match_count = (new_response_ids[:min_len] == valid_response_ids[:min_len].cpu()).sum().item()
-                print(f"  token match in first {min_len} tokens: {match_count}/{min_len}")
-                if match_count < min_len:
-                    # Find first mismatch
-                    for j in range(min_len):
-                        if new_response_ids[j] != valid_response_ids[j].cpu():
-                            print(f"  FIRST MISMATCH at pos {j}: new={new_response_ids[j].item()} "
-                                  f"('{target_tokenizer.decode([new_response_ids[j].item()])}') vs "
-                                  f"orig={valid_response_ids[j].item()} "
-                                  f"('{src_tokenizer.decode([valid_response_ids[j].item()])}')")
-                            break
+                prompt_content_len = int(prompt_attention_mask.sum().item())
+                print(f"  teacher prompt token length after padding: {prompt_content_len}/{prompt_length}")
+                print(f"  response ids first 20: {response_block[:20].tolist()}")
+                print(f"  response attention first 20: {response_attention_mask[:20].tolist()}")
 
-            # Pad/truncate to match original response_length for alignment
-            if new_response_ids.shape[0] >= response_length:
-                if is_debug and i == 0:
-                    print(f"  -> TRUNCATING new_response_ids from {new_response_ids.shape[0]} to {response_length}")
-                # truncate to original response_length
-                new_response_ids = new_response_ids[:response_length]
-            else:
-                pad_size = response_length - new_response_ids.shape[0]
-                if is_debug and i == 0:
-                    print(f"  -> PADDING new_response_ids from {new_response_ids.shape[0]} by {pad_size} to {response_length}")
-                # right-pad with pad_token_id
-                new_response_ids = torch.cat([
-                    new_response_ids,
-                    torch.full((pad_size,), target_tokenizer.pad_token_id, dtype=new_response_ids.dtype)
-                ])
-            rm_responses.append(new_response_ids.unsqueeze(0))
+            rm_input_ids.append(torch.cat([prompt_input_ids.squeeze(0), response_block], dim=0).unsqueeze(0))
+            rm_attention_mask.append(
+                torch.cat([prompt_attention_mask.squeeze(0), response_attention_mask], dim=0).unsqueeze(0)
+            )
+            rm_responses.append(response_block.unsqueeze(0))
 
         rm_input_ids = torch.cat(rm_input_ids, dim=0)
         rm_attention_mask = torch.cat(rm_attention_mask, dim=0)

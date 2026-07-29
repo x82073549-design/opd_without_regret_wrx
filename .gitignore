@@ -1,7 +1,10 @@
-# Python caches
+# Python cache/build artifacts
 __pycache__/
 *.py[cod]
 *.pyo
+*$py.class
+*.so
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -17,8 +20,10 @@ env/
 
 # Training, evaluation, and experiment outputs
 checkpoint/
+checkpoints/
 logs/
 outputs/
+validation_log/
 justrl_eval_outputs/
 wandb/
 swanlab/
@@ -33,7 +38,13 @@ models/
 datasets/*_2k.parquet
 datasets/*-2k.parquet
 
+# Generated validation data
+scripts/val/data_verl/
+
 # Tool and runtime caches
 .cache/
 *.log
+*.lock
 *.tmp
+.DS_Store
+*.swp
