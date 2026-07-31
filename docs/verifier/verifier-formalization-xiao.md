@@ -3,7 +3,7 @@
 > 作者：Xiao  
 > 日期：2026-07-30  
 > 用途：供 Xiao、RA 及后续 GPT 共同 formalize 研究问题。  
-> 状态：Token-level M0 formalization 已冻结；早期探索过程保留作设计依据。实施时以 `OPD_verifier_M0_spec_2026-07-30.md` 为准，不得把尚未通过实验门槛的候选结论写成结果。
+> 状态：**历史 formalization，已不再是当前主线实施方案。** 2026-07-31 会议决定放弃“训练 verifier/controller 再选择 action”的两层架构，改为由 Codex 直接进行受约束的 loss self-evolving。当前方案见 [`loss-self-evolving-meeting-update-xiao-2026-07-31.md`](./loss-self-evolving-meeting-update-xiao-2026-07-31.md)。本文保留用于追踪此前推导与可能的后续分析，不得将其中的 M0 冻结项误作当前实验要求。
 
 ## 1. 一句话研究目标
 
