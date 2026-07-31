@@ -1009,6 +1009,25 @@ FKL/RKL raw/scaled RMS、gradient clipping 状态、投影变化和 fallback 次
 不要将所有参数梯度拼接成单一向量。逐参数张量累计 dot product 与 squared norm
 即可；FSDP/ZeRO 下每个 rank 对本地 shard 累计，最后只 all-reduce 标量。
 
+当前实现决策：沿用现有 **verl FSDP actor backend**，不为该审计切换到
+Megatron、DeepSpeed 或其他训练框架。在 actor 的 backward 完成后、
+gradient clipping 与 `optimizer.step()` 之前执行审计：
+
+1. 固定同一 rollout batch、teacher logits、token mask 与 microbatch 顺序；
+2. 对 P0 backward，保存每个 rank 的本地 baseline gradient shards；
+3. `zero_grad(set_to_none=True)` 后对 intervention backward；
+4. 本地累计 dot product、baseline/intervention squared norm 与 squared
+   difference；
+5. 使用 verl/FSDP 已有的 gradient-reduction process group 对这些标量
+   `all_reduce`，不能默认使用 `WORLD`，以兼容 hybrid sharding；
+6. 审计路径不执行 optimizer step，也不使用 `no_sync()`；若有 gradient
+   accumulation，P0 与 intervention 必须使用完全相同的 microbatches；
+7. FP16 在统计前完成 unscale；BF16 记录实际 gradient dtype；
+8. 显存不足时将 baseline local shards 暂存 CPU，或使用三次 backward 的
+   norm identity，不能因此 gather 完整模型梯度。
+
+该实现只增加一个显式 `gradient_audit` 诊断模式，不进入正常训练热路径。
+
 P0 在相同输入上独立重算一次，得到数值/实现噪声基线
 \((1-C_{\mathrm{repeat}},D_{\mathrm{repeat}})\)。正式运行前预注册相对于该噪声基线
 的最小 intervention-separation 条件，而不是事后选择任意 cosine 阈值。若所有
