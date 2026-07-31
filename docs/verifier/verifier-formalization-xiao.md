@@ -956,7 +956,58 @@ H\in\{5,10,20\}.
 3. P8 one-step 覆盖七动作且 global total weight 精确；
 4. P6/P7 one-step action counts 与总 weight matched；
 5. 单 run 的 step 5/10/20 checkpoint 和双 evaluation-seed-list 流程跑通；
-6. 所有 manifests、hash assignment、seeds 和 failure rules 冻结。
+6. 完成下述 gradient intervention audit，确认动作分配确实改变了 student update；
+7. 所有 manifests、hash assignment、seeds 和 failure rules 冻结。
+
+###### Gradient intervention audit：动作是否真正改变更新
+
+一个关键风险是：token actions、权重直方图和 ESS 虽然发生变化，但不同 token
+的梯度高度同向，或归一化后的增减彼此抵消，导致 aggregate student gradient
+几乎仍等于 fixed OPD。此时“intervention 最终性能没有改善”不能用于判断
+verifier、feature 或 action selection 无效，因为实验实际上没有产生足够强的
+optimization intervention。
+
+在相同冻结 batch、相同 rollout/token mask、相同模型参数、相同 loss
+normalization 下，关闭 dropout 等非必要随机性，并在 FKL/RKL RMS matching
+之后、optimizer step 与 gradient clipping 之前，分别计算：
+
+\[
+g_0=\nabla_\theta L_{\mathrm{OPD}},\qquad
+g_\pi=\nabla_\theta L_\pi .
+\]
+
+至少对 P0 重算 control、一个差异最大的健康 intervention，以及一个当前最有希望
+的 weighting policy，记录：
+
+\[
+C_\pi=
+\cos(g_\pi,g_0)
+=
+\frac{\langle g_\pi,g_0\rangle}
+{\lVert g_\pi\rVert\lVert g_0\rVert},
+\qquad
+D_\pi=
+\frac{\lVert g_\pi-g_0\rVert}{\lVert g_0\rVert}.
+\]
+
+同时记录全模型及 layer/module-level 的 cosine、relative difference 和 norm
+ratio，并与 action/weight histogram、skip/down/baseline/up 比例、ESS、
+FKL/RKL raw/scaled RMS、gradient clipping 状态、投影变化和 fallback 次数关联。
+正确/错误 rollout 与 student-support coverage 分层也需保留，以判断变化是否只
+集中在少量样本。
+
+不要将所有参数梯度拼接成单一向量。逐参数张量累计 dot product 与 squared norm
+即可；FSDP/ZeRO 下每个 rank 对本地 shard 累计，最后只 all-reduce 标量。
+
+P0 在相同输入上独立重算一次，得到数值/实现噪声基线
+\((1-C_{\mathrm{repeat}},D_{\mathrm{repeat}})\)。正式运行前预注册相对于该噪声基线
+的最小 intervention-separation 条件，而不是事后选择任意 cosine 阈值。若所有
+健康 intervention 均表现为 \(C_\pi\approx1\) 且
+\(D_\pi\) 与 repeat noise 同量级，则 Phase 0 暂停：先增强 action contrast、
+检查 token-gradient 共线性与 normalization，或更换能提供更大可学习差异的
+teacher；不得把后续 null result 解释为 verifier 已被否证。若方向/幅度已明显
+改变但 downstream reward 不变，则优先检查 horizon、evaluation noise 与
+credit assignment。
 
 ###### Phase 0 reliability gate
 
