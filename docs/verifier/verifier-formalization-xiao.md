@@ -533,6 +533,19 @@ A_\phi(c_t,a_t^\pi).
 - 相同 pilot-candidate \(H=20\) optimizer steps；正式 horizon 由 reliability pilot 冻结；
 - 相同 teacher 和 evaluation prompts。
 
+这里的“同一个 checkpoint”必须解释为完整训练分支根，而不只是 model weights。
+每条 matched branch 必须同时复制并记录：
+
+- model parameters 与 buffers；
+- optimizer state、step counters 与 LR scheduler；
+- data-iterator position 与 gradient-accumulation position；
+- Python/NumPy/PyTorch/CUDA RNG states；
+- student、teacher、tokenizer、code、config 与 prompt-manifest hashes。
+
+分支前可以共享仅由共同 prefix 决定的 teacher cache；一旦 rollout prefix 分化，
+teacher cache 必须按完整 prefix hash 和 branch namespace 隔离，禁止复用不一致
+prefix 的 logits。上述任一状态无法恢复或核对时，该 matched label 无效。
+
 分别得到：
 
 \[
@@ -828,6 +841,25 @@ A(c,a)=Q(c,a)-Q(c,a^0).
 
 若 Level 1 无法超过 Level 0，结论是当前 intervention labels 不足以识别 state-dependent action value；不能直接跳到更复杂网络。
 
+###### Auxiliary feature-sufficiency diagnostic
+
+在扩大到 Level 2/3 前，使用 Phase 0/1 已计算的 aggregate、sequence 或预注册
+feature-group gradient statistics，额外检查 cheap explicit features 是否包含
+与参数更新有关的信息。目标至少包括：
+
+- reference alignment \(R_\pi\)；
+- relative gradient difference \(D_\pi\)；
+- gradient norm ratio；
+- 可用时的低维 gradient sketch。
+
+依次比较 constant/action-only、ridge linear 和 small MLP，并按 checkpoint、
+batch 与 policy family 拆分，禁止随机拆同一 bag/token。若 cheap features
+不能在 held-out units 上优于 constant/action-only，这不单独否定 downstream
+verifier，因为 gradient alignment 只是一阶 proxy；但它构成 representation
+warning：不得仅靠扩大网络掩盖失败，应先检查 hidden-state summary、
+low-dimensional gradient sketch 或 sequence representation。无论该诊断是否
+通过，真正的容量升级仍必须满足前述 downstream Level 1 → Level 2 gate。
+
 #### M0 冻结的训练、冻结与闭环流程
 
 M0 采用 **offline-train, freeze, then control**。在第一次闭环验证完成前，不在线更新 \(S_\phi\)，也不让 closed-loop student run 的 search-validation 结果回流到 \(S\)。
@@ -1006,6 +1038,36 @@ FKL/RKL raw/scaled RMS、gradient clipping 状态、投影变化和 fallback 次
 正确/错误 rollout 与 student-support coverage 分层也需保留，以判断变化是否只
 集中在少量样本。
 
+仅知道 \(g_\pi\) 与 \(g_0\) 不同，还不能判断变化是否朝向更好的能力方向。因此
+使用与 inner-train、AIME search-validation 和未来 locked test 均隔离的固定
+calibration/probe questions 定义：
+
+\[
+g_{\mathrm{ref}}=\nabla_\theta L_{\mathrm{calibration}}(\theta),
+\]
+
+并增加 aggregate reference-alignment diagnostic：
+
+\[
+R_\pi
+=
+\frac{
+\left\langle g_{\mathrm{ref}},\,g_\pi-g_0\right\rangle
+}{
+\lVert g_{\mathrm{ref}}\rVert\lVert g_0\rVert
+}.
+\]
+
+由于 student update 为 \(-\eta g\)，一阶 Taylor 近似下 \(R_\pi>0\) 表示
+intervention 相对 OPD 更有利于降低 calibration loss；同时记录
+\(\cos(g_{\mathrm{ref}},g_\pi)\) 与
+\(\cos(g_{\mathrm{ref}},g_0)\)。该量只作为机制诊断和 candidate proxy，不作为
+真实 learning-utility label，也不能使用 AIME/search-validation gradient
+计算。需要检查它与实际 one-step calibration-loss change 以及
+\(H\)-step \(Y(\pi)\) 的相关性；若不一致，以独立的 downstream \(Y(\pi)\) 为准。
+M0 先在 batch/sequence aggregate level 计算，不启动 per-token parameter
+gradients。
+
 不要将所有参数梯度拼接成单一向量。逐参数张量累计 dot product 与 squared norm
 即可；FSDP/ZeRO 下每个 rank 对本地 shard 累计，最后只 all-reduce 标量。
 
@@ -1070,6 +1132,24 @@ P6/P7 若在 matched counts 下差异超过 paired noise floor，说明 sequence
 4. 对失败 run 记录失败类型，不用事后替换 policy。
 
 正式样本量不在看到 labels 后随意增加特定方向的 policies；若使用分批扩充，下一批的生成规则和停止条件必须在读取其 labels 前冻结。
+
+Phase 1 还必须回答“状态依赖控制是否必要”。在 early/mid/late checkpoints 上
+计算每个 checkpoint 的事后最佳 policy 与全局最佳固定 policy：
+
+\[
+Y_k^{\mathrm{oracle}}=\max_{\pi}Y_k(\pi),
+\qquad
+\pi_{\mathrm{fixed}}^\star
+=
+\arg\max_\pi\frac{1}{K}\sum_kY_k(\pi).
+\]
+
+比较 \(\frac1K\sum_kY_k^{\mathrm{oracle}}\) 与
+\(\frac1K\sum_kY_k(\pi_{\mathrm{fixed}}^\star)\)，并检查是否存在跨 seeds 可重复的
+policy rank reversals。若 oracle 优势不超过 paired noise floor，且不同阶段没有
+稳定排序变化，则当前数据不支持 state-dependent controller；应报告全局最佳
+fixed policy，而不是继续扩大 verifier。该 gate 不增加当前 18-run Phase 0
+预算，只在多 checkpoint Phase 1 生效。
 
 ##### Phase 2：offline fit
 
