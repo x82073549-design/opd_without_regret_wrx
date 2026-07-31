@@ -557,7 +557,12 @@ J_{\mathrm{search\text{-}val}}
 \left(\theta_{k+H}^{0}\right).
 \]
 
-\(J\) 使用同一批独立 search-validation questions 和相同 decoding seed list 上的 verifier exact-reward `mean@4`。优先记录逐 question paired difference，再求均值，以降低 evaluation sampling noise。
+\(J\) 使用 AIME24/25/26（AIME I/II 合并）的固定 search-validation
+questions，在相同 8 个 decoding seeds 上计算 verifier exact-reward
+`mean@8`。先对每道 question 的 8 次 rollout 求均值，再记录 policy 与 matched
+OPD 的逐 question paired difference，最后跨 question 聚合。统计区间按 question
+做 cluster bootstrap，不能把 rollout 当作独立题目；同时分别报告 AIME24、25、26
+的结果与方向一致性。
 
 M0 首版不从 \(Y(\pi)\) 中扣除计算成本，而是通过固定 optimizer steps、有效 training tokens、rollouts 和 evaluation budget保证比较 matched；wall-clock、显存和失败率作为单独诊断。
 
@@ -881,16 +886,21 @@ Phase 0 冻结：
 - evaluation seed list \(E_1\)：`4, 5, 6, 7`；
 - calibration prompts：64；
 - inner-train prompts：128；
-- search-validation prompts：64；
-- 每个 evaluation prompt 每个 seed list 生成 4 个 rollouts；
-- AIME24/25/26 保持 locked，不进入 Phase 0。
+- inner-train 来源：DAPO-Math-17k；
+- search-validation：AIME24/25/26 的 AIME I/II，共 90 道题；
+- 每个 evaluation prompt 在 \(E_0\cup E_1\) 上生成 8 个 rollouts，主要指标为
+  combined mean@8；
+- \(E_0\) 与 \(E_1\) 各自的 mean@4 仅用于估计 decoding noise 和
+  cross-policy ranking reliability；
+- AIME24/25/26 进入 Phase 0 后不再视为 locked test；正式确认实验必须另行冻结
+  一组未参与 policy/verifier/checkpoint 选择的 independent test。
 
 Phase 0 的训练预算为 18 条 run、最多 `18 × 20 = 360` 个 optimizer-run steps。若三组 horizon checkpoints 全部完成，search-validation evaluation 预算为：
 
 \[
-18\times3\times2\times64\times4
+18\times3\times90\times8
 =
-27{,}648
+38{,}880
 \]
 
 条 response。Pilot 开始后不能因看到某个 policy 的方向而删减其 counter-policy 或额外增加有利候选。
@@ -1188,8 +1198,9 @@ S_{\mathrm{tok}}(c_{k,t},m,w).
 - 输入只使用由 student/teacher 分布计算的 feature；
 - 原 M0 的实现级 search space 区分 OPD surrogate、FKL、top-k RKL、JS 及其 mixture；在新的概念层 formalization 中，OPD 归入 RKL action，是否保留不同 RKL surrogate 作为实现变体需单独审计；
 - 每个候选从同一 checkpoint 进行相同预算的短训练；
-- 使用独立 search-validation 上的 exact-reward mean@4 排序；
-- locked AIME test 不参与搜索；
+- 使用 AIME24/25/26 search-validation 上的 exact-reward combined mean@8
+  排序，并保留两个 mean@4 seed-list 诊断；
+- AIME 已参与搜索，不能再作为 locked test；最终确认需使用另行冻结的独立题集；
 - 不搜索任意 gradient，而搜索 PPO-compatible scalar surrogate。
 
 它可以视为新的三层构想中的 **token-level M0**，但不是完整答案。尤其需要重新讨论：
