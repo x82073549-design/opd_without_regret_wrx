@@ -16,7 +16,9 @@
 - Ruxin 负责确定 Codex 修改 loss 的方式；
 - 两人使用相同的 OPD baseline、验证集和结果格式。
 
-本阶段不研究训练过程中何时切换 loss。动态切换需要后续在不同训练 checkpoint 上比较各个 loss 的效果。
+Ruxin 不等待训练步数结论，先完成 action 定义、静态检查、forward/backward 和 smoke test。Liujiang 确定训练步数后，Ruxin 的首批合法候选再使用该步数进入正式筛选。
+
+本阶段不研究训练过程中何时切换 loss、checkpoint controller 或最终 test 表现。候选参数不能根据 Validation 结果反复调整。
 
 ## 2. 临时评价指标
 
@@ -46,17 +48,22 @@ J_{\mathrm{val}}(\theta_H^{\mathrm{OPD}}).
 候选 loss 和 OPD baseline 必须使用相同的：
 
 - student、teacher 和 tokenizer；
-- 初始 model checkpoint；
-- optimizer 和 scheduler state；
+- 起始 model checkpoint；
+- 起始方式，以及对应的 optimizer 和 scheduler state/初始化；
 - learning rate；
 - 训练数据和数据顺序；
 - batch size 和有效训练 token 数；
 - rollout 配置和随机种子；
-- checkpoint 保存位置；
+- checkpoint 保存频率；
 - validation questions 和 evaluation seeds；
 - 代码版本。
 
-每次实验必须使用独立输出目录。起点为基础模型时使用 `RESUME_MODE=disable`；起点为已有训练 checkpoint 时使用 `RESUME_MODE=resume_path` 和固定的 `RESUME_FROM_PATH`，禁止使用 `auto` 自动寻找 checkpoint。
+每次实验必须使用独立输出目录。起始方式必须二选一：
+
+1. 从完整 trainer checkpoint 开始：使用 `RESUME_MODE=resume_path` 和固定的 `RESUME_FROM_PATH`，恢复 model、optimizer、scheduler、global step 以及框架能够恢复的 dataloader/RNG state；
+2. 从 model checkpoint 开始：使用 `RESUME_MODE=disable`，所有方法重新初始化相同的 optimizer 和 scheduler，并在 manifest 中记录 `fresh_optimizer=true`。
+
+两种起始方式不能混用。禁止使用 `auto` 自动寻找 checkpoint，也不能把第二种方式描述为恢复了相同 optimizer state。
 
 ### 2.2 数据划分
 
@@ -72,7 +79,9 @@ Training、Validation 和 Test 之间需要检查重复数据。
 - `test_manifest.json`；
 - `train_validation_dedup_report.json`。
 
-manifest 至少记录数据文件路径、SHA256、样本数、题目 ID、用途和 evaluation seed list。Test manifest 必须注明在搜索阶段不可访问。
+Validation manifest 至少记录数据文件路径、SHA256、样本数、题目 ID、顺序、用途、prompt template hash 和 evaluation seed list。Test manifest 在搜索阶段只能向 Codex 提供 dataset-level hash、样本数和访问策略，不能提供题面、答案或可访问路径。
+
+不能因为仓库目录名为 `test_data` 就把数据继续视为最终 Test：任何用于本轮选择的数据都必须冻结为 Validation，之后不能再作为最终 Test 报告。当前 manifest 示例暂列 AIME24 和 Minerva，但它们也必须通过真实 parquet 去重检查才能用于正式实验；AIME25、AMC23 或其他数据不能未经检查直接恢复为默认集合。
 
 Validation manifest 的格式参考 `docs/verifier/validation_manifest.example.json`。正式运行时复制为冻结文件，并通过 `VALIDATION_MANIFEST` 传给评测脚本。
 
@@ -103,6 +112,23 @@ python3 scripts/val/check_data_overlap.py \
 
 以下检查通过后，训练步数实验才能用于方法选择。
 
+#### Training run
+
+一条 training run 由起始 checkpoint、method、training seed、代码 commit 和 resolved config 唯一确定。每条 run 连续训练到相对步数 100，并在 20/40/60/80/100 保存 checkpoint；不得为五个步数分别启动五条训练。
+
+正式运行前记录 Git commit、dirty patch hash、Python/PyTorch/verl/vLLM/CUDA 版本、GPU 型号、完整 resolved config 和启动命令。正式 run 期间不得切换代码版本。
+
+#### Training seed
+
+training seed 与 evaluation seed 分开。training seed 至少控制 Python、NumPy、PyTorch CPU/CUDA、rollout engine 和数据顺序中框架允许控制的随机性。正式运行前必须验证：
+
+1. 同方法、同 seed 的短运行能够复现；
+2. 同方法、不同 seed 的 rollout 或训练轨迹确实不同；
+3. resolved config 和 run manifest 中能看到实际生效的 seed；
+4. 同一 seed 在所有方法中于相同执行阶段设置。
+
+仅修改运行名称中的 `seed` 不算完成 seed 控制。
+
 #### 唯一运行标识
 
 每次评测使用唯一的 `EVAL_RUN_ID`：
@@ -122,6 +148,16 @@ python3 scripts/val/check_data_overlap.py \
 - evaluation seed；
 - response；
 - correctness。
+
+预注册两个互斥的 seed lists：
+
+```text
+E0 = [0, 1, 2, 3]
+E1 = [4, 5, 6, 7]
+E  = E0 + E1
+```
+
+主结果使用 `mean@8`，`mean@4(E0)` 和 `mean@4(E1)` 用于检查 evaluation noise。每个 request seed 由 stable question ID 和 evaluation seed 确定；映射规则和 seed list 写入 evaluation manifest。
 
 修改后先执行一次复现检查：同一模型、同一题目、同一 seed list 和相同运行环境独立评测两次，比较逐题输出和分数。
 
@@ -187,6 +223,8 @@ H\in\{20,40,60,80,100\}.
 
 #### Fixed OPD
 
+本计划中的 Fixed OPD 专指以下 fixed top-k OPD，不指 sampled-token OPD。
+
 ```bash
 METHOD=fixed_opd
 ADV_ESTIMATOR=token_reward_direct
@@ -230,11 +268,7 @@ OVERLAP_ROUTE_WBASE=0.5
 
 本阶段的 `Overlap-based OPD` 只指 `prune_opd`，不包含 `prune_opd_event_fkl` 或其他模式。
 
-如果计算资源允许，增加一个对照方法：
-
-- `0.5 × OPD`；或
-- `2.0 × OPD`；或
-- shuffled token weight。
+如果计算资源允许，优先增加 shuffled token weight 作为负对照，并固定 shuffle seed。`0.5 × OPD` 或 `2.0 × OPD` 只作为 loss-scale 诊断，因为 Adam 和 gradient clipping 可能减弱单纯缩放的影响。
 
 所有方法从相同完整 checkpoint 开始，并在相对起点新增以下训练步数后保存 checkpoint：
 
@@ -262,6 +296,14 @@ TRAIN_TOTAL_STEPS=100
 
 两个 training seeds 只能支持初步筛选。形成稳定结论时至少补充第三个 training seed。
 
+标准矩阵为 `3 methods × 2 training seeds = 6 training runs`，共 30 次 checkpoint evaluations。资源不足时按以下顺序完成最低矩阵：
+
+1. 三种方法的 training seed 0；
+2. Fixed OPD 的 training seed 1；
+3. seed 0 下最优的非 baseline 方法补 training seed 1。
+
+正式矩阵前必须通过：三种方法的静态配置检查、小 batch forward/backward、1-step smoke test、training/evaluation seed 审计，以及一条 checkpoint save → merge → generate → grade → paired report 的完整链路。
+
 ### 3.3 需要记录的结果
 
 - validation reward；
@@ -272,8 +314,12 @@ TRAIN_TOTAL_STEPS=100
 - gradient clipping rate；
 - response length；
 - truncation rate；
+- effective response/training tokens；
+- expected/actual generation count；
 - NaN、Inf 和训练失败情况；
 - wall-clock time 和 peak GPU memory。
+
+逐题文件至少保留 method、training seed、relative horizon、task、question ID、evaluation seed、request seed、exact reward、response length、truncation 状态、checkpoint hash 和 evaluation config hash。
 
 ### 3.4 训练步数选择标准
 
@@ -305,13 +351,17 @@ python3 scripts/analysis/paired_eval_report.py \
   --output <candidate>/paired_report.json
 ```
 
-选择满足以下条件的最小训练步数：
+明天下午的 pilot 选择满足以下条件的最小训练步数：
 
 1. 该步数下的最优方法与 step 100 的最优方法一致；
-2. 两个 training seeds 下，最优方法相对 matched OPD 的差值同号；
-3. 两个 evaluation seed lists 的最优方法和关键差值方向一致；
-4. paired bootstrap confidence interval 已报告；
+2. 两个 training seeds 下，top method 相对 runner-up 的差值同号；top method 不是 Fixed OPD 时，同时检查其相对 matched Fixed OPD 的差值；
+3. E0 和 E1 的最优方法及关键差值方向一致；
+4. paired bootstrap confidence interval 已报告，并检查结论是否由单个题目驱动；
 5. 训练过程正常且输出完整。
+
+pilot 结论只能标为“推荐的初步筛选步数”。形成稳定结论还需要：完整方法排名在该步数与 step 100 一致、top-vs-runner-up 的 paired bootstrap 95% CI 不跨 0、leave-one-question-out 后 winner 不变，并至少补充第三个 training seed。若这些条件未满足，不应把 pilot 结论表述为稳定最小步数。
+
+如果 top score 并列，或不同 tie-breaking 会改变 winner，则该步数记为“当前不可区分”。如果 top method 是 Fixed OPD，差值应计算 Fixed OPD 与 runner-up，而不是 Fixed OPD 与自身。
 
 如果 step 100 仍不能稳定区分方法，应明确报告以下一种或多种情况：
 
@@ -367,6 +417,10 @@ python3 scripts/analysis/paired_eval_report.py \
 
 根据候选的合法性、可执行性和可比较性，推荐第一版采用的方式。
 
+两种方式必须使用相同的 Codex model/version、temperature、token budget 和 generation seeds `[0,1,2,3,4]`。每种方式生成 5 个候选：seed 0 固定生成 Fixed OPD identity candidate，seed 1–4 生成新候选。identity candidate 只用于接口一致性测试，不计入新颖性或重复率。
+
+生成前先冻结 `tensor_contract.json`。每个可用输入至少记录 name、shape、dtype、device、valid mask、support、producer、是否需要额外 forward 和是否 stop-gradient。`available_in_current_code=false` 的输入不能进入第一批可执行候选。
+
 ### 4.2 方式一：自由生成
 
 Codex 可以提出：
@@ -388,6 +442,8 @@ Codex 不允许修改：
 - 训练框架；
 - 评价代码。
 
+自由生成只允许实现受限的 loss 函数，不能自由修改训练循环。候选代码禁止文件、网络、子进程、环境变量访问，禁止动态 import、反射、`eval`、`exec`，禁止修改全局 RNG、model parameters、optimizer 或输入 tensor。静态安全检查失败的代码不能进入训练进程。
+
 ### 4.3 方式二：组件组合
 
 一个候选 loss 由以下部分组成。
@@ -398,6 +454,8 @@ Codex 不允许修改：
 - FKL；
 - FKL/RKL mixture；
 - JSD。
+
+每个 divergence 必须声明计算 support。只有取得 full-vocabulary 分布时才能称为 exact FKL/JSD；sampled-token 或 top-k 实现必须在名称和公式中明确近似方式，并定义 renormalization、support mismatch 和 missing probability mass 的处理。
 
 #### Input
 
@@ -411,6 +469,8 @@ Codex 不允许修改：
 - token position；
 - trajectory correctness；
 - normalized training step。
+
+entropy、overlap、trajectory correctness 和 normalized training step 用作 weight/gate 时默认 stop-gradient。本列表表示研究候选，不表示这些输入当前都已实现；第一批 schema 只能开放 `tensor_contract.json` 中确认可用的输入。
 
 #### Weight function
 
@@ -432,8 +492,9 @@ Codex 不允许修改：
 #### Optional regularization
 
 - weight variance penalty；
-- effective sample size constraint；
-- gradient norm penalty。
+- effective sample size constraint。
+
+gradient norm penalty 不进入 v1：真实 gradient norm 通常在 backward 后才可观测，可能需要二阶梯度或修改训练循环。
 
 第一版最多允许：
 
@@ -441,6 +502,8 @@ Codex 不允许修改：
 - 一个 weight function；
 - 一个 normalization；
 - 一个 optional regularization。
+
+所有参数必须有有限范围和默认值。v1 中 mixture coefficient 位于 `[0,1]`；active token weight 经过确定性 projection 后同时满足 `[0,2]` 和 active-token mean 1；active set 为空或 raw weights 全为 0 时回退到 Fixed OPD unit weights 并记录 fallback；没有 valid token 时返回有限 zero loss 并记录 empty-batch event。sign-flipped weight 只能作为 diagnostic，不进入安全候选集合。
 
 ### 4.4 比较方法
 
@@ -450,22 +513,28 @@ Codex 不允许修改：
 - 允许使用的输入；
 - 当前训练统计；
 - 禁止修改的内容；
-- 现有 loss 实现。
+- 现有 loss 实现；
+- `tensor_contract.json`；
+- 候选输出 schema 和数值约束。
 
-分别要求 Codex 生成 5 个候选 loss。
+每个候选必须输出 candidate ID、generation mode/seed、tensor contract version、数学定义、使用的输入、divergence support、参数值与范围、normalization/fallback、Python 实现、code hash、与 Fixed OPD 的预期关系和已知数值风险。缺少必要字段的候选记为 schema failure，不由人工补全。
 
-对每个候选检查：
+按以下顺序检查候选：
 
-1. 数学定义是否完整；
-2. 是否只使用允许的输入；
-3. 是否修改禁止修改的内容；
-4. 是否可以确定地转换为配置和代码；
-5. forward 是否成功；
-6. backward 是否成功；
-7. loss 和 gradient 是否有限；
-8. token weight 是否满足范围和归一化；
-9. 是否与已有候选重复；
-10. 需要多少人工修改才能运行。
+1. schema、数学定义和 support 完整性；
+2. AST/import/I/O/副作用安全检查；
+3. tensor contract、允许输入和 stop-gradient 检查；
+4. 重复候选和确定性 code/config hash；
+5. synthetic boundary cases；
+6. recorded real batch forward/backward；
+7. finite loss/gradient、mask、weight、projection 和 fallback；
+8. 1–5 step smoke test；
+9. Fixed OPD identity test；
+10. 人工修改量。
+
+synthetic tests 至少覆盖 padding、空 active set、全零/极端 raw weights、bf16/fp32 和 normalization fallback。上一步失败的候选不进入下一步，所有失败均保留原始响应和原因。
+
+identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp32 loss `rtol≤1e-5, atol≤1e-6`，bf16 loss `rtol≤1e-3, atol≤1e-4`，fp32 gradient cosine similarity `≥0.999`、relative L2 error `≤1e-3`，并保持 mask、empty-batch 和 fallback 行为一致。
 
 ### 4.5 必须支持的基础方法
 
@@ -482,6 +551,8 @@ Codex 不允许修改：
 - shuffled token weight；
 - sign-flipped token weight。
 
+“能够表示”和“当前能够执行”必须分开记录。缺少 full-vocabulary 分布时，Fixed FKL/JSD 只能标为 top-k 或 sampled approximation。`0.5×/2.0× OPD` 作为 projection 之外的整体 loss-scale diagnostic；shuffled/sign-flipped weight 必须标为 diagnostic-only，与可进入训练搜索的安全 action 隔离。
+
 ### 4.6 执行顺序
 
 本任务不等待任务一确定最终训练步数，按以下顺序执行：
@@ -497,7 +568,9 @@ Codex 不允许修改：
 
 比较两种方式的：
 
+- schema 完整率；
 - 合法候选比例；
+- 确定性 code/config 转换率；
 - forward/backward 通过率；
 - smoke test 通过率；
 - 与 Fixed OPD 的一致性；
@@ -506,6 +579,20 @@ Codex 不允许修改：
 - 是否能够自动检查；
 - 是否能够控制 loss scale；
 - 是否能清楚说明候选之间的差异。
+
+人工修改量分为：零修改、格式修复、局部逻辑修复和实质性重写。需要实质性重写的候选不计为自动生成成功。
+
+一种方式通过最低可用标准需要同时满足：
+
+1. Fixed OPD identity candidate 通过全部阈值；
+2. validator 能阻止发现的安全违规候选进入执行；
+3. 4 个新候选中至少 3 个 schema 完整、合法并可完成 forward/backward，且不需要实质性重写；
+4. 至少 2 个新候选通过 smoke test；
+5. 所有接受候选能够从原始响应确定性地产生相同 code/config hash。
+
+每种方式只有 4 个新候选，因此这些比例只用于本次 pipeline pilot，不能外推为 Codex 的长期生成成功率。
+
+如果两种方式均通过且前四项没有实质差异，第一版优先组件组合，因为更易审计和复现。自由生成只有在同样通过安全和执行标准，并产生组件 grammar 无法表达的合法候选时才优先。两种方式均未通过时，结论为“当前 action 接口不足”，不能强行二选一。
 
 ### 4.8 Codex 分析要求
 
@@ -520,14 +607,16 @@ Codex 不允许修改：
 ### 4.9 提交材料
 
 1. 两种方式使用的 prompt；
-2. 每种方式生成的 5 个候选；
-3. 候选的数学公式和代码；
-4. 静态检查结果；
-5. forward/backward 和 smoke test 结果；
-6. Fixed OPD 一致性测试；
-7. 两种方式的比较表；
-8. 推荐的 action 定义；
-9. 第一批可执行候选列表。
+2. Codex model/version、generation 参数和 paired generation seeds；
+3. `tensor_contract.json` 和 validator 规则；
+4. 每种方式生成的 5 个原始候选；
+5. 候选的数学公式、resolved config、代码和 hash；
+6. 安全、静态和数值边界检查结果；
+7. forward/backward 和 smoke test 结果；
+8. Fixed OPD identity test 的逐项误差；
+9. 两种方式的比较表；
+10. 推荐的 action 定义；
+11. 第一批可执行候选及失败候选列表。
 
 ### 4.10 验收标准
 
@@ -538,7 +627,10 @@ Codex 不允许修改：
 - 允许使用的输入；
 - 允许使用的组件；
 - 参数范围和归一化规则；
-- 哪些候选可以进入下一轮训练实验。
+- diagnostic-only action 如何隔离；
+- 两种方式是否分别通过最低可用标准；
+- 哪些候选可以进入下一轮训练实验；
+- 如果均未通过，需要修改 tensor contract、schema 还是 validator。
 
 ## 5. 协作要求
 
@@ -559,6 +651,8 @@ Codex 不允许修改：
 - Ruxin 不等待训练步数结论，先完成两种 loss 设计方式的比较和执行检查；
 - Ruxin 产生的新候选，在任务一完成后使用推荐的训练步数进行正式筛选；
 - 相同配置的 OPD baseline 结果只运行一次并共享，避免重复使用计算资源。
+
+资源不足时优先保证实验有效性，顺序为：seed/目录/manifest/逐题结果正确，Fixed OPD 两个 training seeds，三种方法的 seed 0，初步最优候选补 seed 1，其他候选补 seed，负对照，最后才是 200/300-step 长期确认。不能为了按时给出数字而降低无效实验标准或使用 Locked Test。
 
 ## 6. 明天下午验收内容
 
