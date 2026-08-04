@@ -69,11 +69,19 @@ def process_jsonl_file(file_name):
             data = json.loads(line)
             id = int(data["example_id"])
             while len(results) <= id:
-                results.append({"gt": None, "responses": []})
+                results.append({"gt": None, "question": "", "responses": [], "metadata": []})
             gt = data["answer"]
             response = data["response"]
             results[id]["gt"] = gt
+            results[id]["question"] = data.get("prompt", "")
             results[id]["responses"].append(response)
+            results[id]["metadata"].append(
+                {
+                    "example_id": id,
+                    "evaluation_seed": data.get("evaluation_seed", data.get("seed")),
+                    "request_seed": data.get("request_seed"),
+                }
+            )
     return results
 
 def parse_hyperparameters_from_filename(filename):
@@ -122,26 +130,44 @@ def grade_file(file_path, use_model_verifier=True):
     all_questions = []
     all_ground_truths = []
     rule_based_scores = []
+    flat_metadata = []
 
     for i in range(len(df)):
         if "jsonl" in str(file_path):
             responses = df[i]["responses"]
             gt = df[i]["gt"]
             question = df[i].get("question", "")
+            response_metadata = df[i].get("metadata", [])
         else:
             responses = df["responses"][i]
             gt = df["reward_model"][i]["ground_truth"]
             question = df["reward_model"][i].get("question", "")
+            response_metadata = [
+                {"example_id": i, "evaluation_seed": response_index}
+                for response_index in range(len(responses))
+            ]
 
         responses_list = [str(response) for response in responses]
+        if len(response_metadata) != len(responses_list):
+            raise ValueError(
+                f"Response metadata count mismatch for example {i}: "
+                f"{len(response_metadata)} metadata rows for {len(responses_list)} responses."
+            )
         response_lengths += [get_len(response) for response in responses_list]
         
         not_formated = ["boxed" not in response for response in responses_list]
         without_boxed += sum(not_formated)
 
-        for response in responses_list:
+        for response_index, response in enumerate(responses_list):
             rule_score = grade_answer_verl(response, gt)
             rule_based_scores.append(rule_score)
+            flat_metadata.append(
+                {
+                    **response_metadata[response_index],
+                    "response_length": get_len(response),
+                    "format_valid": "boxed" in response,
+                }
+            )
             
             # Only prepare for model verification if rule-based failed AND verification is enabled
             if not rule_score and use_model_verifier:
@@ -208,7 +234,27 @@ def grade_file(file_path, use_model_verifier=True):
     results["avg_output_length"] = sum(response_lengths) / len(response_lengths) if response_lengths else 0
     results["format_error_rollouts"] = without_boxed
 
-    return results
+    if len(flat_metadata) != len(final_scores):
+        raise ValueError(
+            f"Detailed result count mismatch: {len(flat_metadata)} metadata rows for {len(final_scores)} scores."
+        )
+
+    detailed_results = []
+    for metadata, score in zip(flat_metadata, final_scores):
+        detailed_results.append(
+            {
+                "task": task_name,
+                "question_id": metadata["example_id"],
+                "evaluation_seed": metadata.get("evaluation_seed"),
+                "request_seed": metadata.get("request_seed"),
+                "correct": bool(score),
+                "response_length": metadata["response_length"],
+                "format_valid": metadata["format_valid"],
+                "source_file": file_path.name,
+            }
+        )
+
+    return results, detailed_results
 
 def main():
     parser = argparse.ArgumentParser(description="Grade evaluation results.")
@@ -222,6 +268,17 @@ def main():
         default=None,
         help="Path to write grading_results.json. Defaults to EVAL_DIR/grading_results.json.",
     )
+    parser.add_argument(
+        "--detailed-output-file",
+        default=None,
+        help="Path to write per-question, per-evaluation-seed JSONL results.",
+    )
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument("--method", default=None)
+    parser.add_argument("--training-seed", default=None)
+    parser.add_argument("--root-step", type=int, default=None)
+    parser.add_argument("--delta-steps", type=int, default=None)
+    parser.add_argument("--code-commit", default=None)
     parser.add_argument(
         "--verifier-model",
         default=MODEL_NAME,
@@ -241,6 +298,11 @@ def main():
 
     eval_dir = Path(args.eval_dir)
     output_file = Path(args.output_file) if args.output_file else eval_dir / "grading_results.json"
+    detailed_output_file = (
+        Path(args.detailed_output_file)
+        if args.detailed_output_file
+        else eval_dir / "detailed_results.jsonl"
+    )
 
     global vllm_model, model_tokenizer, sampling_params, length_tokenizer
     try:
@@ -266,20 +328,54 @@ def main():
         print("Model verifier disabled by default. Running in rule-based only mode.")
 
     all_results = []
+    all_detailed_results = []
     if not eval_dir.exists():
         print(f"Directory {eval_dir} does not exist.")
         return
 
-    for file_path in eval_dir.glob("*.jsonl"):
+    for file_path in sorted(eval_dir.glob("*.jsonl")):
+        if file_path.resolve() == detailed_output_file.resolve():
+            continue
         print(f"Processing file: {file_path}")
-        file_result = grade_file(file_path, use_model_verifier=args.enable_model_verifier)
-        if file_result:
+        grade_output = grade_file(file_path, use_model_verifier=args.enable_model_verifier)
+        if grade_output:
+            file_result, detailed_results = grade_output
+            run_metadata = {
+                "run_id": args.run_id,
+                "method": args.method,
+                "training_seed": args.training_seed,
+                "root_step": args.root_step,
+                "delta_steps": args.delta_steps,
+                "code_commit": args.code_commit,
+            }
+            file_result.update(run_metadata)
             all_results.append(file_result)
+            for detailed_result in detailed_results:
+                detailed_result.update(run_metadata)
+            all_detailed_results.extend(detailed_results)
+
+    pair_keys = [
+        (row["task"], row["question_id"], row["evaluation_seed"])
+        for row in all_detailed_results
+    ]
+    if len(pair_keys) != len(set(pair_keys)):
+        raise ValueError(
+            "Duplicate (task, question_id, evaluation_seed) rows found across generation files. "
+            "Use a new EVAL_RUN_ID or remove stale outputs after checking them."
+        )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with output_file.open("w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=4)
+        json.dump(all_results, f, indent=4, ensure_ascii=False)
+        f.write("\n")
+
+    detailed_output_file.parent.mkdir(parents=True, exist_ok=True)
+    with detailed_output_file.open("w", encoding="utf-8") as f:
+        for result in all_detailed_results:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
     print(f"Grading results saved to {output_file}")
+    print(f"Detailed results saved to {detailed_output_file}")
 
 if __name__ == "__main__":
     main()

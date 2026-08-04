@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import random
 import re
 import argparse
@@ -8,6 +9,7 @@ import multiprocessing  # Added for spawn-based worker management
 import gc  # Added for explicit resource cleanup
 import torch  # Added for CUDA cache cleanup
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from tqdm import tqdm
@@ -98,16 +100,22 @@ def split_rollout_ids(rollout_ids: list[int], num_workers: int):
     return chunks
 
 
+def make_request_seed(example_id: int, evaluation_seed: int) -> int:
+    """Derive a stable per-question request seed shared across evaluated models."""
+    payload = f"{example_id}:{evaluation_seed}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big") & 0x7FFFFFFF
+
+
 # --------------------------------------------------------------------------- #
 #              Worker process (one model instance per GPU worker)              #
 # --------------------------------------------------------------------------- #
 def worker_process(args_tuple):
     """
     Each worker runs on a single GPU:
-    args_tuple = (model_name, samples, rollout_id_list, gpu_id, enable_thinking)
+    args_tuple = (model_name, samples, evaluation_seed_list, gpu_id, enable_thinking)
     gpu_id: values such as "0" or "3", used for CUDA_VISIBLE_DEVICES
     """
-    model_name, samples, rollout_id_list, gpu_id, enable_thinking = args_tuple
+    model_name, samples, evaluation_seed_list, gpu_id, enable_thinking = args_tuple
     
     # CUDA_VISIBLE_DEVICES must be set inside the spawned process.
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
@@ -118,7 +126,7 @@ def worker_process(args_tuple):
     
     try:
         print(
-            f"[GPU {gpu_id}] | Model: {model_name} | rollouts len={len(rollout_id_list)} "
+            f"[GPU {gpu_id}] | Model: {model_name} | seeds len={len(evaluation_seed_list)} "
             f"| loading model (TP=1, enable_thinking={enable_thinking})...",
             flush=True,
         )
@@ -148,19 +156,10 @@ def worker_process(args_tuple):
             tokenizer = None
             print(f"[GPU {gpu_id}] Warning: Could not get tokenizer for stop tokens: {e}", flush=True)
         
-        for rollout_id in rollout_id_list:
-            sampling = SamplingParams(
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                max_tokens=MAX_TOKENS,
-                stop_token_ids=stop_token_ids if stop_token_ids else None,
-            )
-
+        for evaluation_seed in evaluation_seed_list:
             if tokenizer is None:
                 raise RuntimeError("Tokenizer is required for apply_chat_template, but it could not be loaded.")
 
-            # Do not set request-level seeds here. Per-request generators can
-            # force vLLM to fall back from the FlashInfer sampler path.
             formatted_prompts = [
                 tokenizer.apply_chat_template(
                     [{"role": "user", "content": s["prompt"]}],
@@ -170,9 +169,19 @@ def worker_process(args_tuple):
                 )
                 for s in samples
             ]
+            sampling_params = [
+                SamplingParams(
+                    temperature=TEMPERATURE,
+                    top_p=TOP_P,
+                    max_tokens=MAX_TOKENS,
+                    stop_token_ids=stop_token_ids if stop_token_ids else None,
+                    seed=make_request_seed(sample["example_id"], evaluation_seed),
+                )
+                for sample in samples
+            ]
             
             # Disable per-worker tqdm output to keep multi-process logs readable.
-            outputs = llm.generate(formatted_prompts, sampling, use_tqdm=False)
+            outputs = llm.generate(formatted_prompts, sampling_params, use_tqdm=False)
             
             for sample, out in zip(samples, outputs):
                 results.append(
@@ -180,14 +189,16 @@ def worker_process(args_tuple):
                         "example_id": sample["example_id"],
                         "prompt": sample["prompt"],
                         "answer": sample["answer"],
-                        "seed": rollout_id,
+                        "evaluation_seed": evaluation_seed,
+                        "request_seed": make_request_seed(sample["example_id"], evaluation_seed),
+                        # Retain the legacy key for downstream readers.
+                        "seed": evaluation_seed,
                         "response": out.outputs[0].text,
                     }
                 )
     
     except Exception as e:
-        print(f"[GPU {gpu_id}] Critical Error: {e}", flush=True)
-        # For debugging, error details could be stored in results or logged directly.
+        raise RuntimeError(f"[GPU {gpu_id}] evaluation worker failed: {e}") from e
     
     finally:
         # Explicitly release vLLM resources.
@@ -230,6 +241,66 @@ def parse_tasks(task_specs, default_n):
     return tasks
 
 
+def load_task_manifest(manifest_path: str, default_n: int) -> list[dict]:
+    """Load evaluation tasks from a JSON manifest."""
+    path = Path(manifest_path).resolve()
+    with path.open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if isinstance(manifest, dict) and manifest.get("purpose") not in (None, "validation"):
+        raise ValueError("Task manifest purpose must be 'validation'.")
+    entries = manifest.get("datasets") if isinstance(manifest, dict) else manifest
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Task manifest must contain a non-empty 'datasets' list.")
+
+    tasks = []
+    for entry in entries:
+        if not isinstance(entry, dict) or "name" not in entry or "path" not in entry:
+            raise ValueError("Each task manifest entry must contain 'name' and 'path'.")
+        task_path = Path(entry["path"])
+        if not task_path.is_absolute():
+            task_path = path.parent / task_path
+        task_path = task_path.resolve()
+        if not task_path.is_file():
+            raise FileNotFoundError(f"Validation dataset does not exist: {task_path}")
+        expected_sha256 = entry.get("sha256")
+        if expected_sha256 is not None:
+            actual_sha256 = sha256_file(str(task_path))
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    f"Validation dataset hash mismatch for {task_path}: "
+                    f"expected {expected_sha256}, got {actual_sha256}."
+                )
+        tasks.append(
+            {
+                "name": str(entry["name"]),
+                "path": str(task_path),
+                "N": int(entry.get("n", default_n)),
+                "expected_num_questions": entry.get("num_questions"),
+            }
+        )
+    return tasks
+
+
+def parse_seed_list(seed_spec: Optional[str], default_n: int) -> list[int]:
+    """Parse a comma-separated evaluation seed list, or default to range(default_n)."""
+    if seed_spec is None:
+        return list(range(default_n))
+    seeds = [int(value.strip()) for value in seed_spec.split(",") if value.strip()]
+    if not seeds:
+        raise ValueError("--seeds must contain at least one integer seed.")
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("--seeds must not contain duplicate values.")
+    return seeds
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main():
     global MAX_TOKENS, TEMPERATURE, TOP_P, REPLACE
 
@@ -249,9 +320,15 @@ def main():
     )
     parser.add_argument("--model", action="append", dest="models", help="HF model path. Can be passed multiple times.")
     parser.add_argument("--task", action="append", dest="tasks", help="Task spec NAME:PARQUET[:N]. Can be passed multiple times.")
+    parser.add_argument("--task-manifest", default=None, help="JSON manifest containing a datasets list.")
     parser.add_argument("--out-dir", default="justrl_eval_outputs", help="Directory for generated jsonl files.")
     parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids, one vLLM worker per GPU.")
     parser.add_argument("--n", type=int, default=16, help="Default number of rollouts per problem.")
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma-separated evaluation seeds. The first task N seeds are used for each task.",
+    )
     parser.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     parser.add_argument("--temperature", type=float, default=TEMPERATURE)
     parser.add_argument("--top-p", type=float, default=TOP_P)
@@ -260,7 +337,13 @@ def main():
     args = parser.parse_args()
 
     model_names = args.models or MODEL_NAMES
-    tasks = parse_tasks(args.tasks, args.n) if args.tasks else TASKS
+    if args.task_manifest and args.tasks:
+        raise ValueError("Use either --task-manifest or --task, not both.")
+    if args.task_manifest:
+        tasks = load_task_manifest(args.task_manifest, args.n)
+    else:
+        tasks = parse_tasks(args.tasks, args.n) if args.tasks else TASKS
+    evaluation_seeds = parse_seed_list(args.seeds, args.n)
     gpu_workers = [gpu.strip() for gpu in args.gpus.split(",") if gpu.strip()]
     if not gpu_workers:
         raise ValueError("--gpus must contain at least one GPU id.")
@@ -284,18 +367,88 @@ def main():
             task_name = task["name"]
             task_path = task["path"]
             N = task["N"]
+            if N > len(evaluation_seeds):
+                raise ValueError(
+                    f"Task {task_name} requests N={N}, but only {len(evaluation_seeds)} evaluation seeds were provided."
+                )
+            task_seeds = evaluation_seeds[:N]
 
             print(f"Starting evaluation for task: {task_name} (N={N})")
             
-            out_path = OUT_DIR / f"{task_name.lower()}_t{TEMPERATURE}_p{TOP_P}_n{N}-MNT{MAX_TOKENS}.jsonl"
+            seed_spec = ",".join(str(seed) for seed in task_seeds)
+            seed_hash = hashlib.sha256(seed_spec.encode("utf-8")).hexdigest()[:10]
+            out_path = OUT_DIR / (
+                f"{task_name.lower()}_t{TEMPERATURE}_p{TOP_P}_n{N}-MNT{MAX_TOKENS}-ES{seed_hash}.jsonl"
+            )
+            manifest_path = out_path.with_suffix(".manifest.json")
 
             # --- Repetition Check ---
             if not REPLACE and out_path.exists():
+                if not manifest_path.exists():
+                    raise RuntimeError(
+                        f"Result file exists without a generation manifest: {out_path}. "
+                        "Use --replace after checking the stale output."
+                    )
+                with manifest_path.open(encoding="utf-8") as f:
+                    existing_manifest = json.load(f)
+                expected_existing_values = {
+                    "model": str(Path(model_name).resolve()),
+                    "task": task_name,
+                    "task_path": str(Path(task_path).resolve()),
+                    "task_sha256": sha256_file(task_path),
+                    "evaluation_seeds": task_seeds,
+                    "temperature": TEMPERATURE,
+                    "top_p": TOP_P,
+                    "max_tokens": MAX_TOKENS,
+                    "enable_thinking": args.enable_thinking,
+                }
+                mismatches = {
+                    key: {"expected": value, "actual": existing_manifest.get(key)}
+                    for key, value in expected_existing_values.items()
+                    if existing_manifest.get(key) != value
+                }
+                if mismatches:
+                    raise RuntimeError(
+                        f"Existing evaluation output does not match the requested configuration: {mismatches}. "
+                        "Use a new run ID or --replace after checking the output."
+                    )
+                existing_rows = []
+                with out_path.open(encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            existing_rows.append(json.loads(line))
+                existing_pairs = {
+                    (row["example_id"], row.get("evaluation_seed", row.get("seed")))
+                    for row in existing_rows
+                }
+                expected_count = int(existing_manifest.get("expected_generations", -1))
+                num_questions = int(existing_manifest.get("num_questions", -1))
+                expected_pairs = {
+                    (example_id, evaluation_seed)
+                    for example_id in range(num_questions)
+                    for evaluation_seed in task_seeds
+                }
+                if (
+                    expected_count != num_questions * len(task_seeds)
+                    or len(existing_rows) != expected_count
+                    or existing_pairs != expected_pairs
+                ):
+                    raise RuntimeError(
+                        f"Existing evaluation output is incomplete: expected {expected_count} rows, "
+                        f"got {len(existing_rows)} rows and {len(existing_pairs)} unique pairs; "
+                        "the exact question/seed pairs must match the manifest."
+                    )
                 print(f"Result file already exists at '{out_path}'. Skipping.")
                 continue  # Skip to the next task
 
             # 1. Load original prompts
             samples = load_samples(task_path)
+            expected_num_questions = task.get("expected_num_questions")
+            if expected_num_questions is not None and len(samples) != int(expected_num_questions):
+                raise ValueError(
+                    f"Validation dataset size mismatch for {task_name}: "
+                    f"expected {expected_num_questions}, got {len(samples)}."
+                )
 
             # Append suffix prompt to each sample
             for sample in samples:
@@ -306,22 +459,22 @@ def main():
                 print("Example prompt after formatting:")
                 print(samples[0]["prompt"])
             
-            # 2. Generate rollout IDs and split across GPUs.
-            # These IDs are bookkeeping only; they no longer control vLLM RNG.
-            rollout_ids = list(range(N))
-            rollout_chunks = split_rollout_ids(rollout_ids, num_workers)
+            # 2. Split explicit evaluation seeds across GPUs.
+            seed_chunks = split_rollout_ids(task_seeds, num_workers)
 
             # 3. Launch workers, with each worker using one GPU.
             all_results = []
             args_list = [
-                (model_name, samples, rollout_chunks[i], gpu_workers[i], args.enable_thinking)
+                (model_name, samples, seed_chunks[i], gpu_workers[i], args.enable_thinking)
                 for i in range(num_workers)
+                if seed_chunks[i]
             ]
             
             # Use the spawn start method for worker processes.
             ctx = multiprocessing.get_context("spawn")
             
-            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as ex:
+            worker_failures = []
+            with concurrent.futures.ProcessPoolExecutor(max_workers=len(args_list), mp_context=ctx) as ex:
                 futures = [ex.submit(worker_process, tup) for tup in args_list]
                 
                 # Track overall progress with tqdm.
@@ -331,15 +484,48 @@ def main():
                         res = fut.result()
                         all_results.extend(res)
                     except Exception as e:
-                        print(f"A worker process failed with error: {e}")
+                        worker_failures.append(str(e))
+
+            if worker_failures:
+                raise RuntimeError("Evaluation worker failures:\n" + "\n".join(worker_failures))
 
             print(f"Total generations collected for {task_name}: {len(all_results)}")
+
+            expected_count = len(samples) * len(task_seeds)
+            observed_pairs = [(item["example_id"], item["evaluation_seed"]) for item in all_results]
+            if len(all_results) != expected_count or len(set(observed_pairs)) != expected_count:
+                raise RuntimeError(
+                    f"Incomplete evaluation for {task_name}: expected {expected_count} unique "
+                    f"(example_id, evaluation_seed) pairs, got {len(all_results)} rows and "
+                    f"{len(set(observed_pairs))} unique pairs."
+                )
+
+            all_results.sort(key=lambda item: (item["example_id"], item["evaluation_seed"]))
 
             # 4. Save to disk
             if all_results:
                 with out_path.open("w", encoding="utf-8") as f:
                     for item in all_results:
                         f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                manifest = {
+                    "model": str(Path(model_name).resolve()),
+                    "task": task_name,
+                    "task_path": str(Path(task_path).resolve()),
+                    "task_sha256": sha256_file(task_path),
+                    "num_questions": len(samples),
+                    "evaluation_seeds": task_seeds,
+                    "request_seed_scheme": "sha256(example_id:evaluation_seed) first 31 bits",
+                    "expected_generations": expected_count,
+                    "actual_generations": len(all_results),
+                    "temperature": TEMPERATURE,
+                    "top_p": TOP_P,
+                    "max_tokens": MAX_TOKENS,
+                    "enable_thinking": args.enable_thinking,
+                    "output_file": str(out_path.resolve()),
+                }
+                with manifest_path.open("w", encoding="utf-8") as f:
+                    json.dump(manifest, f, ensure_ascii=False, indent=2)
+                    f.write("\n")
                 print(f"Saved results for {task_name} to {out_path}")
             else:
                 print(f"No results collected for {task_name} (Check for errors).")

@@ -56,7 +56,7 @@ J_{\mathrm{val}}(\theta_H^{\mathrm{OPD}}).
 - validation questions 和 evaluation seeds；
 - 代码版本。
 
-每次实验必须关闭自动恢复，并使用独立输出目录。
+每次实验必须使用独立输出目录。起点为基础模型时使用 `RESUME_MODE=disable`；起点为已有训练 checkpoint 时使用 `RESUME_MODE=resume_path` 和固定的 `RESUME_FROM_PATH`，禁止使用 `auto` 自动寻找 checkpoint。
 
 ### 2.2 数据划分
 
@@ -65,6 +65,25 @@ J_{\mathrm{val}}(\theta_H^{\mathrm{OPD}}).
 - Test set：只在最终方法确定后使用，不进入当前实验，也不提供给 Codex。
 
 Training、Validation 和 Test 之间需要检查重复数据。
+
+正式实验前需要提交：
+
+- `validation_manifest.json`；
+- `test_manifest.json`；
+- `train_validation_dedup_report.json`。
+
+manifest 至少记录数据文件路径、SHA256、样本数、题目 ID、用途和 evaluation seed list。Test manifest 必须注明在搜索阶段不可访问。
+
+Validation manifest 的格式参考 `docs/verifier/validation_manifest.example.json`。正式运行时复制为冻结文件，并通过 `VALIDATION_MANIFEST` 传给评测脚本。
+
+使用以下命令生成训练集与验证集的重复数据报告：
+
+```bash
+python3 scripts/val/check_data_overlap.py \
+  --train datasets/dapo-math-17k.parquet \
+  --validation-manifest docs/verifier/validation_manifest.json \
+  --output docs/verifier/train_validation_dedup_report.json
+```
 
 ### 2.3 无效实验
 
@@ -79,6 +98,60 @@ Training、Validation 和 Test 之间需要检查重复数据。
 - token weight 违反预先规定的范围或归一化规则。
 
 该评价指标是当前的临时标准。后续需要用更长训练验证它是否能够预测最终结果。
+
+### 2.4 运行和评测前置检查
+
+以下检查通过后，训练步数实验才能用于方法选择。
+
+#### 唯一运行标识
+
+每次评测使用唯一的 `EVAL_RUN_ID`：
+
+```text
+{method}_trainseed{training_seed}_root{root_step}_delta{delta_steps}
+```
+
+`MODEL_NAME`、`MERGED_DIR` 和结果目录必须包含该标识。已合并模型必须保存原始 checkpoint 路径；路径不一致时禁止复用。
+
+#### Evaluation seed
+
+评测脚本必须把真实 seed 传给生成引擎。输出中的每条记录必须包含：
+
+- task；
+- question ID；
+- evaluation seed；
+- response；
+- correctness。
+
+修改后先执行一次复现检查：同一模型、同一题目、同一 seed list 和相同运行环境独立评测两次，比较逐题输出和分数。
+
+#### 输出完整性
+
+每个任务的预期输出数为：
+
+\[
+N_{\mathrm{expected}}
+=
+N_{\mathrm{questions}}
+\times
+N_{\mathrm{evaluation\ seeds}}.
+\]
+
+实际输出数或唯一 `(question_id, evaluation_seed)` 数不等于预期值时，评测失败。不能使用部分输出计算总体分数。
+
+#### Checkpoint 步数
+
+计划中的 \(H\) 表示相对起始 checkpoint 新增的训练步数：
+
+\[
+H
+=
+\text{final global step}
+-
+\text{root global step}.
+\]
+
+`trainer.total_training_steps` 是绝对终止步数。例如，从 `global_step_40` 开始再训练 20 步，应设置终止步数为 60。
 
 ## 3. 任务一：确定候选 Loss 的训练步数
 
@@ -104,26 +177,90 @@ H\in\{20,40,60,80,100\}.
 2. Sampled-token gate OPD；
 3. Overlap-based OPD。
 
+三种方法固定为以下配置。未列出的可选 gate、route 和 mask 全部关闭。
+
+可执行配置文件位于：
+
+- `configs/presearch/fixed_opd.env`；
+- `configs/presearch/sampled_token_gate_opd.env`；
+- `configs/presearch/overlap_prune_opd.env`。
+
+#### Fixed OPD
+
+```bash
+METHOD=fixed_opd
+ADV_ESTIMATOR=token_reward_direct
+LOG_PROB_TOP_K=16
+TOP_K_STRATEGY=only_stu
+REWARD_WEIGHT_MODE=student_p
+USE_KL=False
+SAMPLED_TOKEN_GATE_OPD_ENABLE=False
+TOPK_TOKEN_GATE_OPD_ENABLE=False
+OVERLAP_ROUTE_OPD_ENABLE=False
+OUTCOME_OPD_MASK_ENABLE=False
+```
+
+#### Sampled-token gate OPD
+
+在 Fixed OPD 基础上设置：
+
+```bash
+METHOD=sampled_token_gate_opd
+SAMPLED_TOKEN_GATE_OPD_ENABLE=True
+SAMPLED_TOKEN_GATE_OPD_BETA=1.0
+SAMPLED_TOKEN_GATE_OPD_CENTER=0.0
+SAMPLED_TOKEN_GATE_OPD_MIN_GATE=0.0
+SAMPLED_TOKEN_GATE_OPD_OPD_COEF=1.0
+```
+
+#### Overlap-based OPD
+
+在 Fixed OPD 基础上设置：
+
+```bash
+METHOD=overlap_prune_opd
+OVERLAP_ROUTE_OPD_ENABLE=True
+OVERLAP_ROUTE_MODE=prune_opd
+OVERLAP_ROUTE_TAU=0.7
+OVERLAP_ROUTE_TOP_K=16
+OVERLAP_ROUTE_TRIGGER=first_low
+OVERLAP_ROUTE_WDROP=0.01
+OVERLAP_ROUTE_WBASE=0.5
+```
+
+本阶段的 `Overlap-based OPD` 只指 `prune_opd`，不包含 `prune_opd_event_fkl` 或其他模式。
+
 如果计算资源允许，增加一个对照方法：
 
 - `0.5 × OPD`；或
 - `2.0 × OPD`；或
 - shuffled token weight。
 
-所有方法从相同完整 checkpoint 开始，并在以下训练步数保存 checkpoint：
+所有方法从相同完整 checkpoint 开始，并在相对起点新增以下训练步数后保存 checkpoint：
 
 ```text
 20, 40, 60, 80, 100
 ```
 
+使用 2-GPU 脚本时必须显式设置：
+
+```bash
+SAVE_FREQ=20
+TRAIN_TOTAL_STEPS=100
+```
+
+如果从非零 root checkpoint 恢复，`TRAIN_TOTAL_STEPS` 应设置为 `root_step + 100`。
+
 每个 checkpoint 使用第 2 节定义的临时评价指标计算结果。
 
-原则上每种方法运行两个随机种子。如果计算资源不足：
+所有方法使用相同的 training seed 集合。原则上每种方法运行两个随机种子。如果计算资源不足：
 
 - OPD baseline 至少运行两个随机种子；
 - 其他方法先运行一个随机种子；
 - 对初步最优方法补充第二个随机种子；
 - 结果必须注明为初步结论。
+
+两个 training seeds 只能支持初步筛选。形成稳定结论时至少补充第三个 training seed。
 
 ### 3.3 需要记录的结果
 
@@ -140,13 +277,41 @@ H\in\{20,40,60,80,100\}.
 
 ### 3.4 训练步数选择标准
 
+对方法 \(L\)、training seed \(s\) 和训练步数 \(H\)，计算 matched OPD 差值：
+
+\[
+\Delta_{H,s}(L)
+=
+J_{\mathrm{val}}(\theta_{H,s}^{L})
+-
+J_{\mathrm{val}}(\theta_{H,s}^{\mathrm{OPD}}).
+\]
+
+评价时需要：
+
+- 按 `(question_id, evaluation_seed)` 计算 paired delta；
+- 分别报告 training-seed variation 和 evaluation-seed variation；
+- 将 evaluation seeds 预先分为两个不重叠的列表，分别计算结果；
+- 使用 paired bootstrap，并以 question 为重采样单位；
+- 同一 question 下所有方法和 evaluation seeds 必须一起重采样；
+- 报告 95% confidence interval。
+
+逐方法与 matched OPD 的配对报告可以使用：
+
+```bash
+python3 scripts/analysis/paired_eval_report.py \
+  --candidate <candidate>/detailed_results.jsonl \
+  --baseline <baseline>/detailed_results.jsonl \
+  --output <candidate>/paired_report.json
+```
+
 选择满足以下条件的最小训练步数：
 
 1. 该步数下的最优方法与 step 100 的最优方法一致；
-2. 最优方法相对 OPD 的差值大于 OPD 不同随机种子之间的波动；
-3. 不同随机种子下的结果方向一致；
-4. 训练过程正常；
-5. 结论不依赖单次异常评价。
+2. 两个 training seeds 下，最优方法相对 matched OPD 的差值同号；
+3. 两个 evaluation seed lists 的最优方法和关键差值方向一致；
+4. paired bootstrap confidence interval 已报告；
+5. 训练过程正常且输出完整。
 
 如果 step 100 仍不能稳定区分方法，应明确报告以下一种或多种情况：
 
@@ -154,6 +319,8 @@ H\in\{20,40,60,80,100\}.
 - 当前方法差异不足；
 - validation 噪声过大；
 - 需要增加随机种子或评价样本。
+
+当前 step 100 只是短程参考终点。该实验只能判断较早 checkpoint 是否能够预测 step-100 排名，不能证明其能够预测完整训练后的最终排名。后续需要把 OPD、短程最优方法、短程最差方法和一个 scale control 继续训练到至少 300 steps 进行确认。
 
 ### 3.5 Codex 分析要求
 
@@ -171,10 +338,14 @@ H\in\{20,40,60,80,100\}.
 2. step 20/40/60/80/100 的结果表；
 3. validation reward 曲线；
 4. 相对 OPD baseline 的结果曲线；
-5. OPD baseline 的随机种子波动；
-6. Codex 的分析；
-7. 推荐的最小训练步数；
-8. 单次实验的时间和显存开销。
+5. 逐题、逐 evaluation seed 的评分文件；
+6. training-seed variation 和 evaluation-seed variation；
+7. paired bootstrap confidence interval；
+8. 三份数据 manifest 和去重报告；
+9. OPD baseline 的随机种子波动；
+10. Codex 的分析；
+11. 推荐的最小训练步数；
+12. 单次实验的时间和显存开销。
 
 ### 3.7 验收标准
 

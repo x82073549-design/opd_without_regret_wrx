@@ -81,8 +81,10 @@ export ENABLE_FORMAT_REWARD=${ENABLE_FORMAT_REWARD:-False}
 export MODEL_DTYPE=${MODEL_DTYPE:-bfloat16}
 export IS_PLOT=${IS_PLOT:-True}
 export LOSS_AGG_MODE=${LOSS_AGG_MODE:-token-mean}
+export METHOD=${METHOD:-opd}
+export TRAINING_SEED=${TRAINING_SEED:-0}
 export TRAIN_TOTAL_STEPS=${TRAIN_TOTAL_STEPS:-}
-export RESUME_MODE=${RESUME_MODE:-auto}
+export RESUME_MODE=${RESUME_MODE:-disable}
 export RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
 
 # Memory-sensitive knobs for 2x80G.
@@ -90,7 +92,7 @@ export VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.55}
 export REWARD_MICRO_BATCH_SIZE_PER_GPU=${REWARD_MICRO_BATCH_SIZE_PER_GPU:-8}
 export REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}
 export ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
-export SAVE_FREQ=${SAVE_FREQ:-80}
+export SAVE_FREQ=${SAVE_FREQ:-20}
 export VAL_N=${VAL_N:-16}
 
 # Optional route/gate features, kept compatible with existing code paths.
@@ -135,7 +137,7 @@ export MAX_MODEL_LEN=$((MAX_MODEL_LEN_TRAIN > MAX_MODEL_LEN_VAL ? MAX_MODEL_LEN_
 export PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$(( ((MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) > 32768) ? (MAX_PROMPT_LENGTH + MAX_RESP_LENGTH) : 32768 ))}
 
 RUN_STAMP=$(date +%Y-%m-%d_%H-%M-%S)
-DEFAULT_EXPERIMENT_NAME=${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-tb_${TRAIN_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-2gpu80g-${RUN_STAMP}
+DEFAULT_EXPERIMENT_NAME=${METHOD}_trainseed${TRAINING_SEED}_${ADV_ESTIMATOR}_${TRAIN_DATASET_NAME}_${ACTOR_MODEL_NAME}_${REWARD_MODEL_NAME}_${MAX_RESP_LENGTH}-T_${TEMPERATURE}-Tch_${TEACHER_TEMPERATURE}-n_${N_RESPONSES}-mbs_${MINI_BATCH_SIZE}-tb_${TRAIN_BATCH_SIZE}-topk_${LOG_PROB_TOP_K}-topk_strategy_${TOP_K_STRATEGY}-rw_${REWARD_WEIGHT_MODE}-2gpu80g-${RUN_STAMP}
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-$DEFAULT_EXPERIMENT_NAME}
 export CKPT_PATH=${CKPT_PATH:-${PROJECT_PATH}/${EXPERIMENT_NAME}}
 
@@ -231,6 +233,8 @@ echo "  MODEL_DTYPE=$MODEL_DTYPE"
 echo "  N_RESPONSES=$N_RESPONSES"
 echo "  MINI_BATCH_SIZE=$MINI_BATCH_SIZE"
 echo "  TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE"
+echo "  METHOD=$METHOD"
+echo "  TRAINING_SEED=$TRAINING_SEED"
 echo "  LOG_PROB_TOP_K=$LOG_PROB_TOP_K"
 echo "  TOP_K_STRATEGY=$TOP_K_STRATEGY"
 echo "  VLLM_GPU_MEMORY_UTILIZATION=$VLLM_GPU_MEMORY_UTILIZATION"
@@ -253,6 +257,7 @@ python3 -m verl.trainer.main_ppo \
     "${TOPK_TOKEN_GATE_ARGS[@]}" \
     "${OUTCOME_OPD_MASK_ARGS[@]}" \
     data.shuffle=False \
+    data.seed="$TRAINING_SEED" \
     data.train_files="$TRAIN_DATASET" \
     data.val_files="$TEST_DATASET" \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
@@ -283,6 +288,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.model_dtype="$MODEL_DTYPE" \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.name=vllm \
+    +actor_rollout_ref.rollout.seed="$TRAINING_SEED" \
     actor_rollout_ref.rollout.temperature="$TEMPERATURE" \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     +actor_rollout_ref.rollout.log_prob_top_k="$LOG_PROB_TOP_K" \

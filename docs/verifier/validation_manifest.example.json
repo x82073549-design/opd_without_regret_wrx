@@ -1,0 +1,19 @@
+{
+  "purpose": "validation",
+  "datasets": [
+    {
+      "name": "AIME24",
+      "path": "../../datasets/test_data/AIME24/test.parquet",
+      "sha256": "dc3ae15e0236828eb95033a68aab60e19da7ea1afdaad80e26924e5f82d3d96f",
+      "num_questions": 30,
+      "n": 8
+    },
+    {
+      "name": "Minerva",
+      "path": "../../datasets/test_data/Minerva/test.parquet",
+      "sha256": "6a83af0cd9e476ee8832200a57158a23978481daa580584645abc52cf3d4b2ed",
+      "num_questions": 272,
+      "n": 8
+    }
+  ]
+}

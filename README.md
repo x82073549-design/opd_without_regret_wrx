@@ -74,6 +74,42 @@ Evaluate a checkpoint after training:
 CKPT=checkpoint/<exp>/global_step_<step>/actor bash scripts/val/eval_opd.sh
 ```
 
+For matched experiment evaluation, set an explicit method, training seed, root step, and evaluation seed list. The evaluator derives a unique run ID from these fields, verifies that a merged model came from the requested checkpoint, and writes per-question, per-seed scores.
+
+```bash
+METHOD=fixed_opd \
+TRAINING_SEED=0 \
+ROOT_STEP=0 \
+DELTA_STEPS=20 \
+EVAL_SEEDS=0,1,2,3,4,5,6,7 \
+N=8 \
+CKPT=checkpoint/<exp>/global_step_20/actor \
+bash scripts/val/eval_opd.sh
+```
+
+To evaluate an explicit validation split, copy and freeze `docs/verifier/validation_manifest.example.json`, then set `VALIDATION_MANIFEST`:
+
+```bash
+VALIDATION_MANIFEST=docs/verifier/validation_manifest.json \
+EVAL_SEEDS=0,1,2,3,4,5,6,7 \
+N=8 \
+CKPT=checkpoint/<exp>/global_step_<step>/actor \
+bash scripts/val/eval_opd.sh
+```
+
+The pre-search method configurations are available under `configs/presearch/` and can be sourced before launching `scripts/train/opd_2gpu_80g.sh`.
+
+Before using a validation manifest, generate the exact prompt-overlap report:
+
+```bash
+python3 scripts/val/check_data_overlap.py \
+  --train datasets/dapo-math-17k.parquet \
+  --validation-manifest docs/verifier/validation_manifest.json \
+  --output docs/verifier/train_validation_dedup_report.json
+```
+
+The command exits with status 2 when exact or normalized-text overlaps are found.
+
 ### Environment Setup
 
 OPD/RL training is built on the vendored [verl](https://github.com/verl-project/verl) backend. The recommended setup is:
@@ -250,6 +286,17 @@ Common overrides:
 
 ```bash
 GPU_IDS=0,1 N=16 MAX_TOKENS=31744 CKPT=checkpoint/<exp>/global_step_<step>/actor bash scripts/val/eval_opd.sh
+```
+
+Evaluation outputs include `grading_results.json` for aggregate metrics and `detailed_results.jsonl` for paired analysis by task, question, and evaluation seed. Generation manifests record the task file hash, seed list, generation settings, and expected output count.
+
+Compare a candidate against its matched OPD baseline with question-level paired bootstrap:
+
+```bash
+python3 scripts/analysis/paired_eval_report.py \
+  --candidate justrl_eval_outputs/<candidate>/detailed_results.jsonl \
+  --baseline justrl_eval_outputs/<baseline>/detailed_results.jsonl \
+  --output paired_report.json
 ```
 
 Results are written to `justrl_eval_outputs/<merged_model_name>/grading_results.json`.
