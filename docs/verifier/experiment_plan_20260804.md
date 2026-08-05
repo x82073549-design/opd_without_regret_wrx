@@ -8,7 +8,7 @@
 本阶段为 Codex 自动设计 OPD loss 准备两个必要条件：
 
 1. 确定候选 loss 至少训练多少步后才可以进行初步比较；
-2. 确定 Codex 应当自由生成 loss，还是从预先定义的组件中组合 loss。
+2. 确定 Codex 应当自由生成 loss，还是基于包含论文、已有方法和前序实验的冻结参考库生成 loss。
 
 两项任务并行推进：
 
@@ -413,7 +413,7 @@ pilot 结论只能标为“推荐的初步筛选步数”。形成稳定结论�
 比较以下两种 Codex loss 设计方式：
 
 1. Codex 自由生成 loss 公式和 Python 实现；
-2. Codex 从预先定义的组件中组合 loss。
+2. Codex 基于冻结的 loss 参考库（loss reference library）生成候选。
 
 根据候选的合法性、可执行性和可比较性，推荐第一版采用的方式。
 
@@ -444,7 +444,26 @@ Codex 不允许修改：
 
 自由生成只允许实现受限的 loss 函数，不能自由修改训练循环。候选代码禁止文件、网络、子进程、环境变量访问，禁止动态 import、反射、`eval`、`exec`，禁止修改全局 RNG、model parameters、optimizer 或输入 tensor。静态安全检查失败的代码不能进入训练进程。
 
-### 4.3 方式二：组件组合
+### 4.3 方式二：参考库约束生成
+
+reference library 不只包含基础组件，也可以包含：
+
+- 论文中的 loss 及其公式、适用条件和来源；
+- 仓库已有或团队提出的 loss；
+- 前序实验中表现较好、较差或失败的 loss 及其结果摘要；
+- 从这些 loss 中抽取的 divergence、input、weight、normalization 和 regularization 组件。
+
+每个完整 loss 或组件必须记录来源、数学定义、代码位置、所需 tensor/support、参数范围、已知结果和失败条件。实验结果摘要至少记录 method/config hash、训练步数、matched baseline 差值、seed/置信区间、运行状态和结论。前序实验只能使用 Training/Validation 的结果摘要，不能包含 Locked Test 内容。
+
+Codex 可以：
+
+1. 直接选择或调整一个已有 loss；
+2. 组合多个兼容组件；
+3. 根据已有 loss 和实验现象提出新候选。
+
+reference library 必须在一轮候选生成前冻结并记录版本/hash。同一轮中不能根据某个候选的 Validation 结果临时增加、删除或修改参考项；实验结果只能在下一轮开始前按统一规则加入新版本。
+
+以下是 reference library 中第一版可用的组件集合。
 
 一个候选 loss 由以下部分组成。
 
@@ -516,6 +535,8 @@ gradient norm penalty 不进入 v1：真实 gradient norm 通常在 backward 后
 - 现有 loss 实现；
 - `tensor_contract.json`；
 - 候选输出 schema 和数值约束。
+
+两种方式使用相同的基础 prompt、接口约束和预算。必要差异仅限于生成方式说明：自由生成只获得 Fixed OPD reference；参考库约束生成额外获得冻结的 reference library。比较时必须记录 prompt 和 library version/hash，不能同时改变其他输入。
 
 每个候选必须输出 candidate ID、generation mode/seed、tensor contract version、数学定义、使用的输入、divergence support、参数值与范围、normalization/fallback、Python 实现、code hash、与 Fixed OPD 的预期关系和已知数值风险。缺少必要字段的候选记为 schema failure，不由人工补全。
 
@@ -592,16 +613,16 @@ identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp3
 
 每种方式只有 4 个新候选，因此这些比例只用于本次 pipeline pilot，不能外推为 Codex 的长期生成成功率。
 
-如果两种方式均通过且前四项没有实质差异，第一版优先组件组合，因为更易审计和复现。自由生成只有在同样通过安全和执行标准，并产生组件 grammar 无法表达的合法候选时才优先。两种方式均未通过时，结论为“当前 action 接口不足”，不能强行二选一。
+如果两种方式均通过且前四项没有实质差异，第一版优先参考库约束生成，因为它可以利用论文、已有实现和前序实验，同时更易审计和复现。自由生成只有在同样通过安全和执行标准，并持续产生 reference library 无法表达的合法候选时才优先。两种方式均未通过时，结论为“当前 action 接口不足”，不能强行二选一。
 
 ### 4.8 Codex 分析要求
 
 根据比较结果，要求 Codex：
 
-1. 推荐自由生成或组件组合；
+1. 推荐自由生成或参考库约束生成；
 2. 说明推荐依据；
-3. 指出当前组件是否完整；
-4. 推荐保留、删除或增加的组件；
+3. 指出当前 reference library 和组件是否完整；
+4. 推荐保留、删除或增加的完整 loss、实验结论或组件；
 5. 给出第一批可以进入训练实验的候选 loss。
 
 ### 4.9 提交材料
@@ -609,23 +630,25 @@ identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp3
 1. 两种方式使用的 prompt；
 2. Codex model/version、generation 参数和 paired generation seeds；
 3. `tensor_contract.json` 和 validator 规则；
-4. 每种方式生成的 5 个原始候选；
-5. 候选的数学公式、resolved config、代码和 hash；
-6. 安全、静态和数值边界检查结果；
-7. forward/backward 和 smoke test 结果；
-8. Fixed OPD identity test 的逐项误差；
-9. 两种方式的比较表；
-10. 推荐的 action 定义；
-11. 第一批可执行候选及失败候选列表。
+4. reference library、版本/hash 和每项来源记录；
+5. 每种方式生成的 5 个原始候选；
+6. 候选的数学公式、resolved config、代码和 hash；
+7. 安全、静态和数值边界检查结果；
+8. forward/backward 和 smoke test 结果；
+9. Fixed OPD identity test 的逐项误差；
+10. 两种方式的比较表；
+11. 推荐的 action 定义；
+12. 第一批可执行候选及失败候选列表。
 
 ### 4.10 验收标准
 
 必须明确回答：
 
-- 第一版使用自由生成还是组件组合；
+- 第一版使用自由生成还是参考库约束生成；
 - 推荐的 action 结构；
 - 允许使用的输入；
 - 允许使用的组件；
+- reference library 如何根据论文和前序实验更新；
 - 参数范围和归一化规则；
 - diagnostic-only action 如何隔离；
 - 两种方式是否分别通过最低可用标准；
@@ -666,7 +689,7 @@ identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp3
 
 ### Ruxin
 
-- 自由生成与组件组合的比较结果；
+- 自由生成与参考库约束生成的比较结果；
 - 推荐的 loss action 定义；
 - 合法性和执行测试结果；
 - 第一批可执行候选 loss。
