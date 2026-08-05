@@ -8,12 +8,12 @@
 本阶段为 Codex 自动设计 OPD loss 准备两个必要条件：
 
 1. 确定候选 loss 至少训练多少步后才可以进行初步比较；
-2. 确定 Codex 应当自由生成 loss，还是基于包含论文、已有方法和前序实验的冻结参考库生成 loss。
+2. 建立由 loss memory 支持的自由 loss action，并验证 evolving 链路确实产生有效代码变化。
 
 两项任务并行推进：
 
 - Liujiang 负责确定候选 loss 的训练步数；
-- Ruxin 负责确定 Codex 修改 loss 的方式；
+- Ruxin 负责整理 loss memory、实现自由 loss action 并验证 evolving 链路；
 - 两人使用相同的 OPD baseline、验证集和结果格式。
 
 Ruxin 不等待训练步数结论，先完成 action 定义、静态检查、forward/backward 和 smoke test。Liujiang 确定训练步数后，Ruxin 的首批合法候选再使用该步数进入正式筛选。
@@ -372,7 +372,16 @@ pilot 结论只能标为“推荐的初步筛选步数”。形成稳定结论�
 
 当前 step 100 只是短程参考终点。该实验只能判断较早 checkpoint 是否能够预测 step-100 排名，不能证明其能够预测完整训练后的最终排名。后续需要把 OPD、短程最优方法、短程最差方法和一个 scale control 继续训练到至少 300 steps 进行确认。
 
-### 3.5 Codex 分析要求
+### 3.5 Early stopping
+
+先用完整 100-step pilot 轨迹校准 early stopping，不能在没有回放证据前直接用于正式搜索。比较两类策略：
+
+1. 预注册规则：数值失败立即停止；性能连续多个 checkpoint 明显低于 matched baseline 且差值超过噪声范围时停止；
+2. Codex 判断：向 Codex 提供中间 Validation 轨迹、训练诊断和 uncertainty，由其输出 `continue/stop`、confidence 和理由。
+
+confidence collapse、梯度异常、weight/ESS 塌缩和长期无改进可以作为候选信号，但必须先用已完成轨迹回放。评估指标包括节省的 GPU time、误停率、是否会停止最终 winner，以及不同 seeds 下决策是否一致。Locked Test 不能用于 early stopping。未通过回放审计前，early stopping 只记录建议，不实际终止 run。
+
+### 3.6 Codex 分析要求
 
 向 Codex 提供全部 checkpoint 结果，要求 Codex：
 
@@ -382,7 +391,7 @@ pilot 结论只能标为“推荐的初步筛选步数”。形成稳定结论�
 4. 指出是否需要继续训练到 200 或 300 steps；
 5. 不根据单个最佳 checkpoint 作决定。
 
-### 3.6 提交材料
+### 3.7 提交材料
 
 1. 所有运行配置和随机种子；
 2. step 20/40/60/80/100 的结果表；
@@ -396,8 +405,9 @@ pilot 结论只能标为“推荐的初步筛选步数”。形成稳定结论�
 10. Codex 的分析；
 11. 推荐的最小训练步数；
 12. 单次实验的时间和显存开销。
+13. early stopping 回放结果、误停率和预计节省算力。
 
-### 3.7 验收标准
+### 3.8 验收标准
 
 必须得到以下两种结果之一：
 
@@ -410,18 +420,20 @@ pilot 结论只能标为“推荐的初步筛选步数”。形成稳定结论�
 
 ### 4.1 目标
 
-比较以下两种 Codex loss 设计方式：
+2026-08-05 会议决定：第一版 action 使用自由 loss program，不再把预定义组件作为封闭 action space。论文 loss、仓库已有 loss 和历史实验只作为 memory，帮助 Codex 学习设计原则和避免重复失败。
 
-1. Codex 自由生成 loss 公式和 Python 实现；
-2. Codex 基于冻结的 loss 参考库（loss reference library）生成候选。
+Ruxin 的目标改为：
 
-根据候选的合法性、可执行性和可比较性，推荐第一版采用的方式。
+1. 建立可版本化的 loss memory；
+2. 让 Codex 在受限 loss 接口内自由改变宏观结构；
+3. 验证 parent selection、memory reading、主 action、副 action 和代码写回链路确实生效；
+4. 产生第一批能够运行且与父 loss 有实质差异的候选。
 
-两种方式必须使用相同的 Codex model/version、temperature、token budget 和 generation seeds `[0,1,2,3,4]`。每种方式生成 5 个候选：seed 0 固定生成 Fixed OPD identity candidate，seed 1–4 生成新候选。identity candidate 只用于接口一致性测试，不计入新颖性或重复率。
+副 action 继续用于指定迭代方向，但不能把主 action 限制为旧组件的排列组合。M0 优先探索 divergence、weighting、gating、normalization、support 或组合结构的变化；仅修改常数或少量超参数的 proposal 不作为主要搜索结果，转交普通超参数搜索方法处理。
 
 生成前先冻结 `tensor_contract.json`。每个可用输入至少记录 name、shape、dtype、device、valid mask、support、producer、是否需要额外 forward 和是否 stop-gradient。`available_in_current_code=false` 的输入不能进入第一批可执行候选。
 
-### 4.2 方式一：自由生成
+### 4.2 自由 loss action
 
 Codex 可以提出：
 
@@ -444,9 +456,9 @@ Codex 不允许修改：
 
 自由生成只允许实现受限的 loss 函数，不能自由修改训练循环。候选代码禁止文件、网络、子进程、环境变量访问，禁止动态 import、反射、`eval`、`exec`，禁止修改全局 RNG、model parameters、optimizer 或输入 tensor。静态安全检查失败的代码不能进入训练进程。
 
-### 4.3 方式二：参考库约束生成
+### 4.3 Loss memory
 
-reference library 不只包含基础组件，也可以包含：
+loss memory 包含：
 
 - 论文中的 loss 及其公式、适用条件和来源；
 - 仓库已有或团队提出的 loss；
@@ -461,11 +473,11 @@ Codex 可以：
 2. 组合多个兼容组件；
 3. 根据已有 loss 和实验现象提出新候选。
 
-reference library 必须在一轮候选生成前冻结并记录版本/hash。同一轮中不能根据某个候选的 Validation 结果临时增加、删除或修改参考项；实验结果只能在下一轮开始前按统一规则加入新版本。
+memory 必须版本化并记录 hash。同一批并行候选读取相同的冻结快照；该批实验结束后，将候选、结果、失败原因和 lineage 追加到下一版 memory。Locked Test 不得写入搜索 memory。
 
-以下是 reference library 中第一版可用的组件集合。
+以下组件只用于索引、检索和描述 memory，不是封闭 action grammar。
 
-一个候选 loss 由以下部分组成。
+一个候选 loss 可以使用或扩展以下结构。
 
 #### Divergence
 
@@ -515,18 +527,11 @@ entropy、overlap、trajectory correctness 和 normalized training step 用作 w
 
 gradient norm penalty 不进入 v1：真实 gradient norm 通常在 backward 后才可观测，可能需要二阶梯度或修改训练循环。
 
-第一版最多允许：
+候选必须声明所有参数范围、weight/support、normalization、empty-batch fallback 和预期 loss scale。对 token weighting family，默认要求 non-negative weight、finite loss 和明确的 active/valid mask；需要负权重或超出既有范围的候选必须标为 diagnostic 并单独审核，不能静默进入正式搜索。
 
-- 一个 divergence；
-- 一个 weight function；
-- 一个 normalization；
-- 一个 optional regularization。
+### 4.4 Evolving 链路验证
 
-所有参数必须有有限范围和默认值。v1 中 mixture coefficient 位于 `[0,1]`；active token weight 经过确定性 projection 后同时满足 `[0,2]` 和 active-token mean 1；active set 为空或 raw weights 全为 0 时回退到 Fixed OPD unit weights 并记录 fallback；没有 valid token 时返回有限 zero loss 并记录 empty-batch event。sign-flipped weight 只能作为 diagnostic，不进入安全候选集合。
-
-### 4.4 比较方法
-
-向两种方式提供完全相同的：
+每轮向 Codex 提供：
 
 - OPD baseline；
 - 允许使用的输入；
@@ -534,11 +539,13 @@ gradient norm penalty 不进入 v1：真实 gradient norm 通常在 backward 后
 - 禁止修改的内容；
 - 现有 loss 实现；
 - `tensor_contract.json`；
-- 候选输出 schema 和数值约束。
+- 候选输出 schema 和数值约束；
+- 冻结的 memory snapshot；
+- parent loss、历史结果和本轮副 action。
 
-两种方式使用相同的基础 prompt、接口约束和预算。必要差异仅限于生成方式说明：自由生成只获得 Fixed OPD reference；参考库约束生成额外获得冻结的 reference library。比较时必须记录 prompt 和 library version/hash，不能同时改变其他输入。
+每个候选必须输出 candidate ID、parent IDs、主 action、副 action、memory version、generation seed、tensor contract version、数学定义、使用的输入、divergence support、参数值与范围、normalization/fallback、Python 实现、code hash、与 parent/Fixed OPD 的预期关系和已知数值风险。缺少必要字段的候选记为 schema failure，不由人工补全。
 
-每个候选必须输出 candidate ID、generation mode/seed、tensor contract version、数学定义、使用的输入、divergence support、参数值与范围、normalization/fallback、Python 实现、code hash、与 Fixed OPD 的预期关系和已知数值风险。缺少必要字段的候选记为 schema failure，不由人工补全。
+除专门的 identity test 外，新候选必须与 parent loss 存在可解释的结构或代码差异。每轮保存 Python diff、候选文件 hash，并在训练日志中记录运行时实际加载的 loss module hash。如果连续两轮生成文件相同，或生成文件已变但运行时 hash 未变，判定 evolving 链路失败，先检查 memory reading、parent selection、副 action、代码写回和模块加载，不能继续把它当成有效搜索。
 
 按以下顺序检查候选：
 
@@ -557,9 +564,9 @@ synthetic tests 至少覆盖 padding、空 active set、全零/极端 raw weight
 
 identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp32 loss `rtol≤1e-5, atol≤1e-6`，bf16 loss `rtol≤1e-3, atol≤1e-4`，fp32 gradient cosine similarity `≥0.999`、relative L2 error `≤1e-3`，并保持 mask、empty-batch 和 fallback 行为一致。
 
-### 4.5 必须支持的基础方法
+### 4.5 Memory 初始覆盖
 
-推荐的 action 定义至少能够表示：
+第一版 memory 至少收录并说明：
 
 - Fixed OPD；
 - `0.5 × OPD`；
@@ -572,88 +579,85 @@ identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp3
 - shuffled token weight；
 - sign-flipped token weight。
 
-“能够表示”和“当前能够执行”必须分开记录。缺少 full-vocabulary 分布时，Fixed FKL/JSD 只能标为 top-k 或 sampled approximation。`0.5×/2.0× OPD` 作为 projection 之外的整体 loss-scale diagnostic；shuffled/sign-flipped weight 必须标为 diagnostic-only，与可进入训练搜索的安全 action 隔离。
+“memory 中存在”和“当前能够执行”必须分开记录。缺少 full-vocabulary 分布时，Fixed FKL/JSD 只能标为 top-k 或 sampled approximation。`0.5×/2.0× OPD` 作为整体 loss-scale diagnostic；shuffled/sign-flipped weight 必须标为 diagnostic-only。
 
 ### 4.6 执行顺序
 
 本任务不等待任务一确定最终训练步数，按以下顺序执行：
 
-1. 对全部候选做静态检查；
-2. 对合法候选做小 batch forward/backward；
-3. 对通过检查的候选做 1–5 step smoke test；
-4. 如果资源允许，从两种方式中各选择一个候选，按临时的 100-step 标准运行。
+1. 在独立 branch 中整理现有 loss、论文 loss、历史实验和 memory schema；
+2. 跑通 Fixed OPD identity candidate，验证 loss 接口；
+3. 使用不同副 action 连续生成至少两轮候选，检查 Python diff、候选 hash 和运行时 hash；
+4. 对候选做静态、安全和 tensor contract 检查；
+5. 对合法候选做小 batch forward/backward 和 1–5 step smoke test；
+6. Liujiang 给出推荐训练步数 $H$ 后，再对通过检查的宏观结构候选运行短训练。
 
-100-step 训练结果不是本任务的必要验收条件。本任务首先判断两种方式能否稳定产生合法、可执行和可比较的 loss。
+短训练结果不是本任务的首要验收条件。本任务首先判断 memory → parent/sub-action → code → runtime → result → memory 的闭环是否真实生效。
 
-### 4.7 比较指标
+### 4.7 链路指标
 
-比较两种方式的：
+报告以下指标：
 
-- schema 完整率；
-- 合法候选比例；
-- 确定性 code/config 转换率；
-- forward/backward 通过率；
-- smoke test 通过率；
-- 与 Fixed OPD 的一致性；
-- 重复候选比例；
+- memory 读取和 parent/sub-action 记录完整率；
+- 新候选相对 parent 的结构变化率和重复率；
+- 候选文件 hash 与运行时加载 hash 一致率；
+- schema、静态安全和 tensor contract 通过率；
+- forward/backward 和 smoke test 通过率；
+- Fixed OPD identity test 误差；
 - 人工修改量；
-- 是否能够自动检查；
-- 是否能够控制 loss scale；
-- 是否能清楚说明候选之间的差异。
+- 失败能否写回 memory 并影响下一轮 proposal。
 
-人工修改量分为：零修改、格式修复、局部逻辑修复和实质性重写。需要实质性重写的候选不计为自动生成成功。
+人工修改量分为零修改、格式修复、局部逻辑修复和实质性重写。需要实质性重写的候选不计为自动生成成功。
 
-一种方式通过最低可用标准需要同时满足：
+M0 链路通过需要同时满足：
 
 1. Fixed OPD identity candidate 通过全部阈值；
 2. validator 能阻止发现的安全违规候选进入执行；
-3. 4 个新候选中至少 3 个 schema 完整、合法并可完成 forward/backward，且不需要实质性重写；
-4. 至少 2 个新候选通过 smoke test；
-5. 所有接受候选能够从原始响应确定性地产生相同 code/config hash。
-
-每种方式只有 4 个新候选，因此这些比例只用于本次 pipeline pilot，不能外推为 Codex 的长期生成成功率。
-
-如果两种方式均通过且前四项没有实质差异，第一版优先参考库约束生成，因为它可以利用论文、已有实现和前序实验，同时更易审计和复现。自由生成只有在同样通过安全和执行标准，并持续产生 reference library 无法表达的合法候选时才优先。两种方式均未通过时，结论为“当前 action 接口不足”，不能强行二选一。
+3. 至少两轮 proposal 都保存 parent、副 action、memory version、Python diff 和 hash；
+4. 非 identity proposal 至少产生一个宏观结构变化且通过 forward/backward；
+5. 至少一个新候选通过 1–5 step smoke test；
+6. 训练运行时加载的代码 hash 与候选文件一致；
+7. 成功和失败结果均能确定性写回下一版 memory。
 
 ### 4.8 Codex 分析要求
 
-根据比较结果，要求 Codex：
+根据链路结果，要求 Codex：
 
-1. 推荐自由生成或参考库约束生成；
-2. 说明推荐依据；
-3. 指出当前 reference library 和组件是否完整；
-4. 推荐保留、删除或增加的完整 loss、实验结论或组件；
-5. 给出第一批可以进入训练实验的候选 loss。
+1. 说明读取了哪些 memory 和选择了哪个 parent；
+2. 说明副 action 如何决定本轮迭代方向；
+3. 解释候选相对 parent 的宏观结构变化；
+4. 避免把纯超参数调整包装成新的 loss 结构；
+5. 根据成功和失败结果提出下一轮 proposal；
+6. 给出可以进入短训练的候选 loss。
 
 ### 4.9 提交材料
 
-1. 两种方式使用的 prompt；
-2. Codex model/version、generation 参数和 paired generation seeds；
+1. 使用的 prompt、Codex model/version 和 generation 参数；
+2. 主 action、副 action、parent selection 和 memory reading 逻辑；
 3. `tensor_contract.json` 和 validator 规则；
-4. reference library、版本/hash 和每项来源记录；
-5. 每种方式生成的 5 个原始候选；
+4. loss memory、版本/hash 和每项来源记录；
+5. 至少两轮原始 proposal、Python diff 和 lineage；
 6. 候选的数学公式、resolved config、代码和 hash；
 7. 安全、静态和数值边界检查结果；
 8. forward/backward 和 smoke test 结果；
 9. Fixed OPD identity test 的逐项误差；
-10. 两种方式的比较表；
-11. 推荐的 action 定义；
+10. evolving 链路审计表；
+11. 最终 action 和 memory 定义；
 12. 第一批可执行候选及失败候选列表。
 
 ### 4.10 验收标准
 
 必须明确回答：
 
-- 第一版使用自由生成还是参考库约束生成；
-- 推荐的 action 结构；
+- 自由 loss action 是否产生真实、可运行的结构变化；
+- 主 action、副 action 和 parent selection 如何工作；
 - 允许使用的输入；
-- 允许使用的组件；
-- reference library 如何根据论文和前序实验更新；
+- memory 如何根据论文、现有 loss 和前序实验更新；
 - 参数范围和归一化规则；
 - diagnostic-only action 如何隔离；
-- 两种方式是否分别通过最低可用标准；
+- evolving 闭环是否通过最低可用标准；
 - 哪些候选可以进入下一轮训练实验；
-- 如果均未通过，需要修改 tensor contract、schema 还是 validator。
+- 如果未通过，问题位于 memory、parent/sub-action、代码写回、runtime load、tensor contract 还是 validator。
 
 ## 5. 协作要求
 
@@ -668,14 +672,18 @@ identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp3
 - 结果字段和文件格式；
 - 代码版本和配置 hash。
 
+当前 pilot 沿用 batch size 64；它是临时冻结配置，必须写入 resolved config，若后续会议修改则新开配置版本，不能与已有结果混合。
+
 ### 5.2 并行推进
 
 - Liujiang 直接使用现有 loss 变体确定训练步数；
-- Ruxin 不等待训练步数结论，先完成两种 loss 设计方式的比较和执行检查；
+- Ruxin 不等待训练步数结论，先完成 memory、自由 action 和 evolving 链路检查；
 - Ruxin 产生的新候选，在任务一完成后使用推荐的训练步数进行正式筛选；
 - 相同配置的 OPD baseline 结果只运行一次并共享，避免重复使用计算资源。
 
 资源不足时优先保证实验有效性，顺序为：seed/目录/manifest/逐题结果正确，Fixed OPD 两个 training seeds，三种方法的 seed 0，初步最优候选补 seed 1，其他候选补 seed，负对照，最后才是 200/300-step 长期确认。不能为了按时给出数字而降低无效实验标准或使用 Locked Test。
+
+代码协作采用 base branch 与实验 branch 分离：主分支保留可运行底座；Ruxin 在独立 branch 集成 loss memory、参考实现和 evolving 代码；Liujiang 在独立 branch 保存 horizon/early-stopping 实验。跨机器搜索通过 Git 同步 commit、config、memory 和结果摘要，禁止只在未提交工作区保留实验逻辑。
 
 ## 6. 明天下午验收内容
 
@@ -689,8 +697,9 @@ identity candidate 与仓库 Fixed OPD reference 使用相同 batch，要求 fp3
 
 ### Ruxin
 
-- 自由生成与参考库约束生成的比较结果；
-- 推荐的 loss action 定义；
+- loss memory 和来源清单；
+- 自由 loss action、主/副 action 和 parent selection 定义；
+- 两轮 proposal 的代码 diff/hash 与运行时加载核验；
 - 合法性和执行测试结果；
 - 第一批可执行候选 loss。
 
