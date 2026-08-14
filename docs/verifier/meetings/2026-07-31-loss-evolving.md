@@ -2,7 +2,7 @@
 
 > 整理：Xiao
 > 日期：2026-07-31
-> 状态：历史版本。2026-08-05 已将 action 更新为由 memory 支持的自由 loss program；最新决策见 [`loss-self-evolving-meeting-update-2026-08-05.md`](./loss-self-evolving-meeting-update-2026-08-05.md)。
+> 状态：历史版本。2026-08-05 已将 action 更新为由 memory 支持的自由 loss program；后续会议决定见 [2026-08-05 Loss Evolving 更新](./2026-08-05-loss-evolving.md)。
 > 范围：仅记录 OPD / loss 自动搜索相关结论；不包含另一项 multi-agent 通信优化课题及项目协调事项。
 
 ## 1. 会议后的核心决策

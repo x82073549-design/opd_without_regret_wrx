@@ -1,5 +1,7 @@
 # OPD Loss Search 全流程与逐轮实验详解
 
+> 状态：历史实验记录。本文用于复盘早期自动搜索，不代表当前 State 0 的父节点或执行方案。
+
 ## 1. 执行结果概览
 
 本次搜索配置计划最多运行 5 轮，即 `round_000`–`round_004`；实际完成了 4 轮，即 `round_000`–`round_003`。`round_004` 没有生成 Python loss，也没有 smoke、probe 或 confirmation 记录。
