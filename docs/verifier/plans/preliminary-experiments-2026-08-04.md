@@ -2,9 +2,9 @@
 
 - 初版日期：2026-08-04
 - 当前版本：2026-08-05 会议后执行版
-- 状态：执行前冻结
+- 状态：历史方案；当前 Baseline 实验以 [State 0 选择与复现实验计划](./state-0-selection.md) 为准
 
-本版吸收 [`loss-self-evolving-meeting-update-2026-08-05.md`](./loss-self-evolving-meeting-update-2026-08-05.md) 的决定，替代此前“自由生成与组件组合二选一”的设计。
+本版吸收 [2026-08-05 Loss Evolving 更新](../meetings/2026-08-05-loss-evolving.md) 的决定，替代此前“自由生成与组件组合二选一”的设计。本文保留用于追踪早期训练步数、early stopping 和 action 设计，不再作为当前 State 0 的执行入口。
 
 ## 1. 目标与范围
 

@@ -3,7 +3,7 @@
 > 作者：Xiao  
 > 日期：2026-07-30  
 > 用途：供 Xiao、RA 及后续 GPT 共同 formalize 研究问题。  
-> 状态：**历史 formalization，已不再是当前主线实施方案。** 当前方案见 [`experiment_plan_20260804.md`](./experiment_plan_20260804.md) 和 [`loss-self-evolving-meeting-update-2026-08-05.md`](./loss-self-evolving-meeting-update-2026-08-05.md)。本文只用于追踪此前推导与可能的后续分析，不得将其中的 M0 冻结项误作当前实验要求。
+> 状态：**历史 formalization，已不再是当前主线实施方案。** 当前方案见 [State 0 选择与复现实验计划](../plans/state-0-selection.md)，早期决策见 [2026-08-05 Loss Evolving 更新](../meetings/2026-08-05-loss-evolving.md)。本文只用于追踪此前推导与可能的后续分析，不得将其中的 M0 冻结项误作当前实验要求。
 
 ## 1. 一句话研究目标
 

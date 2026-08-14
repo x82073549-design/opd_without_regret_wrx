@@ -1,3 +1,7 @@
+# OPD Loss 论文索引
+
+> 状态：参考资料。论文描述和论文结果不能替代本项目统一 setting 下的完整实验。
+
 ## 1. 基础 OPD 与 KL 目标修改
 
 | 论文 | Loss 做法 |
@@ -38,4 +42,3 @@
 |---|---|
 | [Uni-OPD: Unifying On-Policy Distillation with a Dual-Perspective Recipe](https://arxiv.org/abs/2605.03677) | 将 token-level OPD reward 聚合成 trajectory return，并要求同一问题下正确轨迹的 return 高于错误轨迹。通过 margin mask 删除排序不一致的 group，或通过 margin shift 调整正确轨迹 return，恢复蒸馏信号与 outcome reward 的顺序一致性。 |
 | [SAF-OPD: Stable Advantage Fusion for On-Policy Distillation](https://arxiv.org/abs/2607.29209) | 将 RLVR 的 response-level advantage 与 OPD 的 token-level advantage 融合。先对 OPD advantage 执行 sparsify-then-compress 控制量级，再对融合系数执行 warmup-then-anneal，避免固定系数导致 entropy collapse 和长期过度模仿教师。 |
-
