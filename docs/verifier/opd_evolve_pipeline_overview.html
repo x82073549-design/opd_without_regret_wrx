@@ -1,0 +1,1485 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="OPD Loss Evolve Pipeline 当前实现、实验复盘与优化路线图">
+  <title>OPD Loss Evolve Pipeline · 当前状态与优化路线</title>
+  <style>
+    :root {
+      --ink: #12201c;
+      --muted: #5b6a64;
+      --paper: #f5f3ed;
+      --surface: #fffdfa;
+      --surface-2: #ece9df;
+      --line: #d8d4c8;
+      --forest: #174f43;
+      --forest-2: #2c6f5d;
+      --mint: #d9e9df;
+      --amber: #d68f29;
+      --amber-soft: #f5e6ca;
+      --red: #a64032;
+      --red-soft: #f2ddd7;
+      --blue: #315c86;
+      --blue-soft: #dce8f2;
+      --shadow: 0 18px 60px rgba(37, 43, 39, 0.08);
+      --radius: 22px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --serif: ui-serif, Georgia, "Noto Serif SC", "Songti SC", serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--paper);
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 14% 4%, rgba(217, 233, 223, 0.9), transparent 24rem),
+        radial-gradient(circle at 93% 16%, rgba(245, 230, 202, 0.72), transparent 28rem),
+        var(--paper);
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.72;
+    }
+
+    a { color: inherit; }
+
+    button {
+      font: inherit;
+    }
+
+    .progress {
+      position: fixed;
+      inset: 0 auto auto 0;
+      z-index: 100;
+      width: 0;
+      height: 4px;
+      background: linear-gradient(90deg, var(--amber), var(--forest-2));
+      box-shadow: 0 0 18px rgba(44, 111, 93, 0.4);
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      min-height: 760px;
+      padding: 30px clamp(24px, 6vw, 92px) 76px;
+      background: #112f29;
+      color: #f7f3e9;
+    }
+
+    .hero::before,
+    .hero::after {
+      content: "";
+      position: absolute;
+      border-radius: 50%;
+      pointer-events: none;
+    }
+
+    .hero::before {
+      width: 540px;
+      height: 540px;
+      right: -170px;
+      top: -210px;
+      border: 1px solid rgba(245, 230, 202, 0.22);
+      box-shadow: 0 0 0 70px rgba(255,255,255,0.02), 0 0 0 140px rgba(255,255,255,0.015);
+    }
+
+    .hero::after {
+      width: 350px;
+      height: 350px;
+      left: -220px;
+      bottom: -210px;
+      background: rgba(214, 143, 41, 0.18);
+      filter: blur(2px);
+    }
+
+    .topbar {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      max-width: 1440px;
+      margin: 0 auto;
+      padding-bottom: 72px;
+      border-bottom: 1px solid rgba(255,255,255,0.12);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      border: 1px solid rgba(255,255,255,0.55);
+      border-radius: 50%;
+      color: #ffd489;
+      font-family: var(--serif);
+      font-size: 14px;
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .meta-pill,
+    .print-button {
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 7px 13px;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      color: #f7f3e9;
+      font-size: 13px;
+      text-decoration: none;
+      backdrop-filter: blur(10px);
+    }
+
+    .print-button {
+      cursor: pointer;
+    }
+
+    .print-button:hover,
+    .print-button:focus-visible {
+      background: rgba(255,255,255,0.12);
+      outline: none;
+    }
+
+    .hero-inner {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.72fr);
+      gap: clamp(48px, 8vw, 130px);
+      align-items: end;
+      max-width: 1440px;
+      margin: 78px auto 0;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 20px;
+      color: #ffd489;
+      font-size: 13px;
+      font-weight: 750;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 42px;
+      height: 1px;
+      background: currentColor;
+    }
+
+    h1 {
+      max-width: 920px;
+      margin: 0;
+      font-family: var(--serif);
+      font-size: clamp(56px, 7.4vw, 108px);
+      font-weight: 520;
+      letter-spacing: -0.055em;
+      line-height: 0.95;
+    }
+
+    h1 span {
+      display: block;
+      margin-top: 17px;
+      color: #c9ddd3;
+      font-family: var(--sans);
+      font-size: 0.34em;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      line-height: 1.25;
+    }
+
+    .hero-lede {
+      max-width: 770px;
+      margin: 32px 0 0;
+      color: rgba(247, 243, 233, 0.78);
+      font-size: clamp(17px, 1.5vw, 21px);
+    }
+
+    .hero-summary {
+      display: grid;
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.13);
+      border-radius: 18px;
+      background: rgba(255,255,255,0.08);
+      box-shadow: 0 24px 80px rgba(0,0,0,0.18);
+    }
+
+    .hero-stat {
+      padding: 21px 22px;
+      background: rgba(10,35,30,0.58);
+    }
+
+    .hero-stat strong {
+      display: block;
+      color: #fff8e8;
+      font-family: var(--serif);
+      font-size: 34px;
+      font-weight: 600;
+      line-height: 1.1;
+    }
+
+    .hero-stat span {
+      display: block;
+      margin-top: 7px;
+      color: rgba(247, 243, 233, 0.62);
+      font-size: 13px;
+    }
+
+    .page-shell {
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1100px);
+      gap: clamp(40px, 6vw, 88px);
+      justify-content: center;
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 72px clamp(22px, 5vw, 76px) 110px;
+    }
+
+    .toc {
+      position: sticky;
+      top: 30px;
+      align-self: start;
+      padding: 20px 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .toc-title {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .toc a {
+      display: block;
+      padding: 7px 10px;
+      border-left: 2px solid transparent;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      text-decoration: none;
+      transition: 160ms ease;
+    }
+
+    .toc a:hover,
+    .toc a.active {
+      border-left-color: var(--amber);
+      color: var(--forest);
+      background: rgba(217,233,223,0.55);
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    section {
+      scroll-margin-top: 30px;
+      padding: 70px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    section:first-child { padding-top: 10px; }
+
+    section:last-child { border-bottom: 0; }
+
+    .section-kicker {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 0 0 13px;
+      color: var(--forest-2);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .section-kicker::after {
+      content: "";
+      width: 44px;
+      height: 1px;
+      background: var(--forest-2);
+      opacity: 0.45;
+    }
+
+    h2 {
+      max-width: 860px;
+      margin: 0;
+      font-family: var(--serif);
+      font-size: clamp(34px, 4vw, 56px);
+      font-weight: 560;
+      letter-spacing: -0.035em;
+      line-height: 1.08;
+    }
+
+    h3 {
+      margin: 0 0 12px;
+      font-size: 21px;
+      line-height: 1.3;
+    }
+
+    .section-lede {
+      max-width: 860px;
+      margin: 21px 0 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .callout {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 18px;
+      margin: 30px 0;
+      padding: 24px;
+      border: 1px solid #cbded4;
+      border-radius: var(--radius);
+      background: linear-gradient(135deg, rgba(217,233,223,0.82), rgba(255,253,250,0.96));
+      box-shadow: var(--shadow);
+    }
+
+    .callout.warn {
+      border-color: #ead4ae;
+      background: linear-gradient(135deg, rgba(245,230,202,0.84), rgba(255,253,250,0.97));
+    }
+
+    .callout-index {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: var(--forest);
+      color: white;
+      font-weight: 800;
+    }
+
+    .warn .callout-index { background: var(--amber); }
+
+    .callout p { margin: 4px 0 0; color: var(--muted); }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 30px;
+    }
+
+    .card {
+      position: relative;
+      min-width: 0;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255,253,250,0.92);
+      box-shadow: 0 9px 34px rgba(37,43,39,0.045);
+    }
+
+    .card.accent {
+      border-color: #bfd3c8;
+      background: linear-gradient(145deg, #f7fbf8, #e9f1ec);
+    }
+
+    .card-number {
+      display: block;
+      margin-bottom: 16px;
+      color: var(--amber);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+    }
+
+    .card p,
+    .card li { color: var(--muted); }
+
+    .card p:last-child { margin-bottom: 0; }
+
+    .card ul {
+      margin: 14px 0 0;
+      padding-left: 20px;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 30px;
+    }
+
+    .status-card {
+      padding: 26px;
+      border-radius: var(--radius);
+    }
+
+    .status-card.current {
+      border: 1px solid #b9d1c5;
+      background: #e7f0eb;
+    }
+
+    .status-card.missing {
+      border: 1px solid #e1c9bd;
+      background: #f4e5df;
+    }
+
+    .status-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .status-label::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .current .status-label { color: var(--forest-2); }
+    .missing .status-label { color: var(--red); }
+
+    .pipeline {
+      display: grid;
+      gap: 0;
+      margin: 34px 0 16px;
+    }
+
+    .pipeline-step {
+      display: grid;
+      grid-template-columns: 54px minmax(0, 1fr) minmax(200px, 0.58fr);
+      gap: 18px;
+      align-items: center;
+      position: relative;
+      padding: 15px 18px;
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      background: rgba(255,253,250,0.9);
+    }
+
+    .pipeline-step:first-child { border-radius: 18px 18px 0 0; }
+    .pipeline-step:last-child { border-bottom: 1px solid var(--line); border-radius: 0 0 18px 18px; }
+
+    .step-no {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: var(--forest);
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .pipeline-step:nth-child(3n+2) .step-no { background: var(--forest-2); }
+    .pipeline-step:nth-child(3n) .step-no { background: var(--blue); }
+
+    .step-title {
+      font-weight: 760;
+    }
+
+    .step-desc {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .step-io {
+      justify-self: stretch;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--surface-2);
+      color: #45534d;
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
+    .flow-strip {
+      display: flex;
+      gap: 8px;
+      align-items: stretch;
+      overflow-x: auto;
+      margin: 32px 0 12px;
+      padding: 6px 2px 14px;
+      scrollbar-width: thin;
+    }
+
+    .flow-node {
+      flex: 0 0 150px;
+      position: relative;
+      padding: 17px 16px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--surface);
+      box-shadow: 0 7px 24px rgba(37,43,39,0.05);
+    }
+
+    .flow-node:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -18px;
+      top: 50%;
+      z-index: 2;
+      width: 28px;
+      height: 28px;
+      margin-top: -14px;
+      border-radius: 50%;
+      background: var(--paper);
+      color: var(--forest-2);
+      font-weight: 900;
+      text-align: center;
+      line-height: 28px;
+    }
+
+    .flow-node strong { display: block; font-size: 14px; }
+    .flow-node span { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+
+    .contract {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(270px, 0.75fr);
+      gap: 18px;
+      margin-top: 30px;
+    }
+
+    pre {
+      overflow: auto;
+      margin: 0;
+      padding: 24px;
+      border-radius: var(--radius);
+      background: #173c34;
+      color: #eef6f1;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.7;
+      box-shadow: var(--shadow);
+    }
+
+    code { font-family: var(--mono); }
+
+    .rule-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .rule {
+      display: grid;
+      grid-template-columns: 26px 1fr;
+      gap: 10px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .rule b { color: var(--forest-2); }
+
+    .timeline {
+      position: relative;
+      display: grid;
+      gap: 18px;
+      margin: 34px 0 0;
+      padding-left: 34px;
+    }
+
+    .timeline::before {
+      content: "";
+      position: absolute;
+      left: 11px;
+      top: 16px;
+      bottom: 16px;
+      width: 2px;
+      background: linear-gradient(var(--forest-2), var(--amber), var(--red));
+    }
+
+    .round {
+      position: relative;
+      display: grid;
+      grid-template-columns: 125px minmax(0, 1fr) 170px;
+      gap: 22px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .round::before {
+      content: "";
+      position: absolute;
+      left: -30px;
+      top: 31px;
+      width: 14px;
+      height: 14px;
+      border: 4px solid var(--paper);
+      border-radius: 50%;
+      background: var(--forest-2);
+      box-shadow: 0 0 0 1px var(--forest-2);
+    }
+
+    .round-id {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.07em;
+    }
+
+    .round-name {
+      display: block;
+      margin-top: 6px;
+      color: var(--ink);
+      font-family: var(--serif);
+      font-size: 22px;
+      line-height: 1.25;
+    }
+
+    .round p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .score {
+      align-self: center;
+      justify-self: end;
+      min-width: 150px;
+      padding: 13px 15px;
+      border-radius: 14px;
+      background: var(--surface-2);
+      text-align: right;
+    }
+
+    .score strong {
+      display: block;
+      font-family: var(--mono);
+      font-size: 18px;
+    }
+
+    .score span { color: var(--muted); font-size: 11px; }
+    .positive strong { color: var(--forest-2); }
+    .negative strong { color: var(--red); }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 30px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--surface);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 820px;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    th {
+      background: #ece9df;
+      color: #445049;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    td { color: var(--muted); }
+    td strong { color: var(--ink); }
+
+    .priority {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 36px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .p0 { background: var(--red-soft); color: var(--red); }
+    .p1 { background: var(--amber-soft); color: #8f5b14; }
+    .p2 { background: var(--blue-soft); color: var(--blue); }
+
+    .architecture {
+      display: grid;
+      gap: 12px;
+      margin-top: 34px;
+    }
+
+    .layer {
+      display: grid;
+      grid-template-columns: 210px minmax(0, 1fr) minmax(220px, 0.55fr);
+      gap: 22px;
+      align-items: center;
+      padding: 21px 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255,253,250,0.94);
+    }
+
+    .layer-title {
+      font-weight: 800;
+    }
+
+    .layer-title span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .layer-desc { color: var(--muted); font-size: 14px; }
+
+    .layer-output {
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--mint);
+      color: var(--forest);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .principles {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 28px;
+    }
+
+    .principle {
+      min-height: 170px;
+      padding: 20px;
+      border-top: 4px solid var(--forest-2);
+      border-radius: 0 0 16px 16px;
+      background: var(--surface);
+    }
+
+    .principle:nth-child(2) { border-top-color: var(--blue); }
+    .principle:nth-child(3) { border-top-color: var(--amber); }
+    .principle:nth-child(4) { border-top-color: var(--red); }
+    .principle p { color: var(--muted); font-size: 13px; }
+
+    .gate-formulas {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 28px;
+    }
+
+    .formula {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--surface);
+    }
+
+    .formula code {
+      display: block;
+      margin: 14px 0;
+      padding: 12px;
+      border-radius: 10px;
+      background: #e9eee9;
+      color: var(--forest);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .formula p { color: var(--muted); font-size: 13px; }
+
+    .matrix {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .matrix-item {
+      display: grid;
+      grid-template-columns: 44px 1fr;
+      gap: 14px;
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(255,253,250,0.85);
+    }
+
+    .matrix-id {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: var(--surface-2);
+      color: var(--forest);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .matrix-item strong { display: block; }
+    .matrix-item span { color: var(--muted); font-size: 13px; }
+
+    .roadmap {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(170px, 1fr));
+      gap: 12px;
+      overflow-x: auto;
+      margin-top: 30px;
+      padding-bottom: 12px;
+    }
+
+    .phase {
+      min-width: 170px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--surface);
+    }
+
+    .phase:first-child { border-color: #d8bdb4; background: #f7eae6; }
+    .phase-tag { color: var(--forest-2); font-family: var(--mono); font-size: 11px; font-weight: 800; }
+    .phase h3 { margin-top: 10px; font-size: 18px; }
+    .phase p { color: var(--muted); font-size: 13px; }
+    .phase-out { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 12px; font-weight: 700; }
+
+    .decision-gates {
+      display: grid;
+      gap: 10px;
+      margin-top: 28px;
+    }
+
+    .decision {
+      display: grid;
+      grid-template-columns: 90px minmax(0, 1fr) minmax(220px, 0.6fr);
+      gap: 18px;
+      align-items: center;
+      padding: 18px 20px;
+      border-left: 5px solid var(--forest-2);
+      border-radius: 0 16px 16px 0;
+      background: var(--surface);
+    }
+
+    .decision:nth-child(2) { border-left-color: var(--amber); }
+    .decision:nth-child(3) { border-left-color: var(--blue); }
+    .decision:nth-child(4) { border-left-color: var(--red); }
+    .decision-id { font-family: var(--mono); font-size: 12px; font-weight: 900; }
+    .decision p { margin: 0; color: var(--muted); font-size: 13px; }
+    .decision-out { color: var(--forest); font-size: 12px; font-weight: 800; }
+
+    .evidence-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 28px;
+    }
+
+    .evidence-link {
+      display: block;
+      padding: 17px 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+      text-decoration: none;
+      transition: 150ms ease;
+    }
+
+    .evidence-link:hover,
+    .evidence-link:focus-visible {
+      border-color: var(--forest-2);
+      transform: translateY(-2px);
+      outline: none;
+    }
+
+    .evidence-link strong { display: block; font-size: 14px; }
+    .evidence-link span { color: var(--muted); font-size: 12px; }
+
+    footer {
+      padding: 44px clamp(22px, 5vw, 76px) 70px;
+      background: #112f29;
+      color: rgba(247,243,233,0.72);
+    }
+
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      gap: 30px;
+      max-width: 1340px;
+      margin: 0 auto;
+      font-size: 13px;
+    }
+
+    .footer-inner strong { color: #fff8e8; }
+
+    @media (max-width: 1080px) {
+      .hero-inner { grid-template-columns: 1fr; }
+      .hero-summary { grid-template-columns: repeat(3, 1fr); }
+      .page-shell { grid-template-columns: 1fr; }
+      .toc { display: none; }
+      .cards, .principles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .round { grid-template-columns: 110px minmax(0, 1fr); }
+      .score { grid-column: 2; justify-self: start; text-align: left; }
+      .layer { grid-template-columns: 180px minmax(0, 1fr); }
+      .layer-output { grid-column: 2; }
+    }
+
+    @media (max-width: 720px) {
+      .hero { min-height: auto; padding: 22px 20px 56px; }
+      .topbar { padding-bottom: 34px; }
+      .meta-pill { display: none; }
+      .hero-inner { margin-top: 48px; gap: 36px; }
+      h1 { font-size: clamp(48px, 15vw, 72px); }
+      h1 span { font-size: 0.4em; }
+      .hero-summary { grid-template-columns: 1fr; }
+      .page-shell { padding: 42px 18px 70px; }
+      section { padding: 52px 0; }
+      .cards, .status-grid, .principles, .gate-formulas, .matrix, .evidence-list { grid-template-columns: 1fr; }
+      .pipeline-step { grid-template-columns: 44px minmax(0, 1fr); }
+      .step-io { grid-column: 2; }
+      .contract { grid-template-columns: 1fr; }
+      .round { grid-template-columns: 1fr; gap: 12px; }
+      .score { grid-column: 1; }
+      .layer { grid-template-columns: 1fr; }
+      .layer-output { grid-column: 1; }
+      .decision { grid-template-columns: 1fr; gap: 8px; }
+      .footer-inner { flex-direction: column; }
+    }
+
+    @media print {
+      @page { size: A4; margin: 14mm; }
+      html, body { background: white; }
+      body { font-size: 11pt; }
+      .progress, .toc, .print-button { display: none !important; }
+      .hero { min-height: 0; padding: 14mm; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      .topbar { padding-bottom: 20px; }
+      .hero-inner { grid-template-columns: 1fr 0.55fr; margin-top: 35px; gap: 30px; }
+      h1 { font-size: 50pt; }
+      .page-shell { display: block; padding: 0; }
+      main { width: 100%; }
+      section { padding: 12mm 0; break-inside: auto; }
+      .card, .round, .layer, .formula, .phase, .callout, .pipeline-step { break-inside: avoid; box-shadow: none; }
+      .flow-strip, .roadmap, .table-wrap { overflow: visible; }
+      .roadmap { grid-template-columns: repeat(5, 1fr); }
+      a { text-decoration: none; }
+      footer { padding: 12mm; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress" id="progress" aria-hidden="true"></div>
+
+  <header class="hero">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark">OPD</span> WITHOUT REGRET</div>
+      <div class="top-actions">
+        <span class="meta-pill">Repository · bd16245</span>
+        <span class="meta-pill">2026-08-14</span>
+        <button class="print-button" type="button" onclick="window.print()">打印 / 导出 PDF</button>
+      </div>
+    </div>
+
+    <div class="hero-inner">
+      <div>
+        <p class="eyebrow">Research system review</p>
+        <h1>Evolve Pipeline<span>当前状态、证据与下一阶段优化路线</span></h1>
+        <p class="hero-lede">
+          本报告区分两条容易混淆的链路：仓库中真实可运行的 OPD 训练链，以及实验记录中描述、但尚未同步到 main 的 loss evolve 搜索链。目标不是继续堆叠 feature，而是把搜索系统升级为可复现、机制可验证、预算与目标一致的研究闭环。
+        </p>
+      </div>
+      <aside class="hero-summary" aria-label="关键结论">
+        <div class="hero-stat"><strong>4</strong><span>已完成 evolve rounds</span></div>
+        <div class="hero-stat"><strong>+0.729 pp</strong><span>当前 champion 相对 Fixed OPD</span></div>
+        <div class="hero-stat"><strong>Partially ready</strong><span>训练底座可运行；搜索源码未进入 main</span></div>
+      </aside>
+    </div>
+  </header>
+
+  <div class="page-shell">
+    <nav class="toc" aria-label="页面目录">
+      <p class="toc-title">Contents</p>
+      <a href="#summary">01 · 执行摘要</a>
+      <a href="#scope">02 · 系统边界</a>
+      <a href="#training">03 · 训练 pipeline</a>
+      <a href="#evolve">04 · Evolve pipeline</a>
+      <a href="#contract">05 · Candidate contract</a>
+      <a href="#rounds">06 · 四轮实验复盘</a>
+      <a href="#diagnosis">07 · 核心瓶颈</a>
+      <a href="#target">08 · 目标架构</a>
+      <a href="#joint-gate">09 · 联合门控</a>
+      <a href="#roadmap">10 · 优化路线</a>
+      <a href="#gates">11 · 决策门槛</a>
+      <a href="#evidence">12 · 证据索引</a>
+    </nav>
+
+    <main>
+      <section id="summary">
+        <p class="section-kicker">01 · Executive summary</p>
+        <h2>现在不是缺少新想法，而是缺少一个能正确判断想法的系统。</h2>
+        <p class="section-lede">
+          现有 pipeline 已经证明 LLM 可以生成结构化 loss，并能通过多层验证进入真实训练；但工程状态、机制验收、短预算评价和最终 selection metric 仍存在断层。继续增加 feature 之前，应先修复这些断层。
+        </p>
+
+        <div class="cards">
+          <article class="card accent">
+            <span class="card-number">WHAT WORKED</span>
+            <h3>温和 routing</h3>
+            <p>唯一稳定正收益候选保留 Fixed OPD 的 support direction，只对可靠 disagreement token 做有界 credit reallocation。</p>
+          </article>
+          <article class="card">
+            <span class="card-number">WHAT FAILED</span>
+            <h3>激进替换与极端稀疏</h3>
+            <p>Union support 两次被同一 device bug 阻断；outcome switch 将约 90% token 置零，再被 scale matching 放大约 11.86 倍。</p>
+          </article>
+          <article class="card">
+            <span class="card-number">WHAT NEXT</span>
+            <h3>先修“判断器”</h3>
+            <p>补齐源码与 lineage，增加机制活性门槛，按 action family 分配多保真预算，再开展 teacher confidence × student entropy 联合门控。</p>
+          </article>
+        </div>
+
+        <div class="callout">
+          <div class="callout-index">!</div>
+          <div>
+            <h3>核心判断</h3>
+            <p>当前系统可视为 <strong>“搜索原型已跑通，但尚未达到研究级可审计闭环”</strong>。训练底座、评测护栏和候选安全接口已经具备；真正缺的是源码同步、failure taxonomy、机制活性测试、多保真筛选和目标一致的 winner selection。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="scope">
+        <p class="section-kicker">02 · System boundary</p>
+        <h2>当前仓库中，训练链是真实代码；evolve 链主要存在于实验记录。</h2>
+        <p class="section-lede">这是理解现状的第一条边界。两条链路不能因为共享 OPD loss 而被视为同一个软件系统。</p>
+
+        <div class="status-grid">
+          <article class="status-card current">
+            <div class="status-label">Available in main</div>
+            <h3>可执行 OPD 训练与评测底座</h3>
+            <ul>
+              <li>2-GPU / 8-GPU 训练入口与 Hydra 配置</li>
+              <li>student rollout、teacher top-k/log-prob/entropy</li>
+              <li>Fixed OPD、sampled/top-k gate、overlap route 等机制</li>
+              <li>checkpoint merge、generation、grading、paired report</li>
+              <li>manifest、seed、数据去重和运行目录隔离护栏</li>
+            </ul>
+          </article>
+          <article class="status-card missing">
+            <div class="status-label">Absent from main</div>
+            <h3>文档引用但未提交的搜索执行器</h3>
+            <ul>
+              <li><code>opd_loss_search/search.py</code> 与 coordinator</li>
+              <li>tensor contract、SafeOps、candidate validator</li>
+              <li>每轮候选 <code>loss.py</code>、state、champion 和 history</li>
+              <li>recorded action batches 与完整 failure traces</li>
+              <li>probe / confirmation 的 resolved manifests</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="callout warn">
+          <div class="callout-index">P0</div>
+          <div>
+            <h3>优化前置条件</h3>
+            <p>首先把搜索源码、运行配置、候选文件和最小可复现实验同步进独立分支。否则我们只能优化“复盘文档中的系统”，无法验证优化是否改变真实行为。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="training">
+        <p class="section-kicker">03 · Current training pipeline</p>
+        <h2>OPD 信号从 rollout 进入 actor update 的真实路径</h2>
+        <p class="section-lede">下面描述 main 中实际存在的数据流。它也是未来所有 evolve candidate 必须遵守的运行边界。</p>
+
+        <div class="pipeline" aria-label="OPD 训练流程">
+          <div class="pipeline-step">
+            <span class="step-no">01</span>
+            <div><div class="step-title">训练入口与冻结配置</div><div class="step-desc">脚本解析模型、数据、seed、top-k、gate 和 checkpoint 设置，交给 Hydra / Ray trainer。</div></div>
+            <div class="step-io">scripts/train/opd_2gpu_80g.sh<br>algorithm.* / actor_rollout_ref.*</div>
+          </div>
+          <div class="pipeline-step">
+            <span class="step-no">02</span>
+            <div><div class="step-title">Student on-policy rollout</div><div class="step-desc">学生生成 response，同时保留 sampled-token log-prob、response mask 和可选 top-k support。</div></div>
+            <div class="step-io">responses · old_log_probs<br>student_top_k_ids/log_probs</div>
+          </div>
+          <div class="pipeline-step">
+            <span class="step-no">03</span>
+            <div><div class="step-title">Teacher feature production</div><div class="step-desc">Reward worker 在同一状态上计算 teacher sampled log-prob、student support 上的 teacher log-prob、teacher top-k 与 entropy。</div></div>
+            <div class="step-io">teacher_response_log_probs<br>teacher_on_student_log_probs<br>teacher_entropy</div>
+          </div>
+          <div class="pipeline-step">
+            <span class="step-no">04</span>
+            <div><div class="step-title">Distillation reward construction</div><div class="step-desc">Actor worker 根据 support strategy 构建 OPD reward；ratio switch、overlap route 和 token gate 目前也在这里硬编码执行。</div></div>
+            <div class="step-io">rm_scores [B,T,K]<br>route/gate diagnostics</div>
+          </div>
+          <div class="pipeline-step">
+            <span class="step-no">05</span>
+            <div><div class="step-title">Reward / feature weighting</div><div class="step-desc">Driver 将 rm_scores 作为 token rewards；可选单 feature 权重在序列内标准化并保持 mean weight≈1。</div></div>
+            <div class="step-io">token_level_rewards<br>teacher_confidence only</div>
+          </div>
+          <div class="pipeline-step">
+            <span class="step-no">06</span>
+            <div><div class="step-title">Advantage 与 policy loss</div><div class="step-desc">token_reward_direct 直接把 token reward 作为 advantage；3D top-k advantage 触发对应 support 上的 log-prob 重算。</div></div>
+            <div class="step-io">advantages [B,T] / [B,T,K]<br>policy gradient</div>
+          </div>
+          <div class="pipeline-step">
+            <span class="step-no">07</span>
+            <div><div class="step-title">更新、checkpoint 与独立评测</div><div class="step-desc">执行 backward、gradient clipping、optimizer step；checkpoint 由独立 generation/grade 流程评估并生成 paired report。</div></div>
+            <div class="step-io">grad_norm · checkpoint<br>detailed_results.jsonl</div>
+          </div>
+        </div>
+
+        <div class="cards">
+          <article class="card">
+            <span class="card-number">FEATURE LIFECYCLE</span>
+            <h3>Student entropy 过早释放</h3>
+            <p>Student entropy 已在 actor forward 中产生，但当前主要用于日志，进入统一 token feature weighting 之前就被移除。</p>
+          </article>
+          <article class="card">
+            <span class="card-number">COUPLING</span>
+            <h3>多个 action 混在 reward worker</h3>
+            <p>Support 构建、divergence、route、gate 和部分 fallback 混在一个大函数中，使 candidate contract、组合测试和 device 管理变得困难。</p>
+          </article>
+          <article class="card">
+            <span class="card-number">EXCLUSIVITY</span>
+            <h3>机制组合由互斥条件控制</h3>
+            <p>sampled gate、top-k gate、overlap route、ratio switch、oracle gate 等存在大量成对互斥，难以系统搜索组合结构。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="evolve">
+        <p class="section-kicker">04 · Recorded evolve pipeline</p>
+        <h2>搜索链已经具备闭环形状，但反馈仍然过度压缩。</h2>
+        <p class="section-lede">以下流程来自四轮搜索记录。它说明系统已经超越“LLM 随机写 loss”，但还没有把失败原因、机制状态和评价目标完整传递到下一轮。</p>
+
+        <div class="flow-strip" aria-label="Evolve 搜索流程">
+          <div class="flow-node"><strong>历史压缩</strong><span>最近 8 轮、champion、简化 symptom</span></div>
+          <div class="flow-node"><strong>Blind brainstorm</strong><span>恰好 6 个结构性假设</span></div>
+          <div class="flow-node"><strong>Soft priors</strong><span>检索 4 个论文方向</span></div>
+          <div class="flow-node"><strong>Proposal</strong><span>1 个低风险 + 1 个自由探索</span></div>
+          <div class="flow-node"><strong>Static validate</strong><span>schema / AST / FP32 / BF16</span></div>
+          <div class="flow-node"><strong>Recorded replay</strong><span>真实 batch、CPU forward/backward</span></div>
+          <div class="flow-node"><strong>GPU smoke</strong><span>双 GPU、1 step、finite gradients</span></div>
+          <div class="flow-node"><strong>10-step probe</strong><span>AIME25 pass@4 proxy</span></div>
+          <div class="flow-node"><strong>100-step confirm</strong><span>2 train seeds、n=16</span></div>
+          <div class="flow-node"><strong>Memory update</strong><span>winner、metrics、next context</span></div>
+        </div>
+
+        <div class="cards">
+          <article class="card accent">
+            <span class="card-number">STRENGTH</span>
+            <h3>约束式 program generation</h3>
+            <p>Candidate 只能在固定接口内生成 tensor program，输入 detach，并受 schema、AST、SafeOps、mask 和 fallback 约束。</p>
+          </article>
+          <article class="card">
+            <span class="card-number">STRENGTH</span>
+            <h3>三层运行验证</h3>
+            <p>合成 batch、真实 recorded batch 和真实 GPU smoke 分别覆盖数值、数据契约与在线分布式运行。</p>
+          </article>
+          <article class="card">
+            <span class="card-number">WEAKNESS</span>
+            <h3>反馈语义损失</h3>
+            <p>下一轮能看到 <code>SMOKE_FAILED</code>，却看不到 device mismatch 等根因，导致基础设施失败被重复当作算法探索。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="contract">
+        <p class="section-kicker">05 · Candidate contract</p>
+        <h2>Candidate 不直接控制训练；它只提出受限 action。</h2>
+        <p class="section-lede">这个边界应保留，并进一步升级成版本化、device-safe、可组合的稳定 ABI。</p>
+
+        <div class="contract">
+          <pre><code>def compute_token_objective(inputs, params, ops):
+    return {
+        "base_advantages": ...,   # [B, T, K]
+        "raw_token_weights": ..., # [B, T]
+        "active_mask": ...,       # [B, T]
+        "metrics": {...},
+    }
+
+# runtime-owned post-processing
+project_weights(mean=1, bounds=[0, 2])
+check_ess_and_fallback()
+weighted = advantages * weights
+final = magnitude_match(weighted, fixed_opd)</code></pre>
+
+          <div class="rule-list">
+            <div class="rule"><b>1</b><span>Candidate 输入全部 detach；禁止模型、optimizer、文件、网络和随机状态访问。</span></div>
+            <div class="rule"><b>2</b><span>Runtime 统一执行 mask、weight projection、ESS 检查和 Fixed OPD fallback。</span></div>
+            <div class="rule"><b>3</b><span>Candidate 必须声明 required inputs、support、normalization 与机制指标。</span></div>
+            <div class="rule"><b>4</b><span>未来应补充 device/dtype canonicalization 和 action-family-specific safety limits。</span></div>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <div class="callout-index">Δ</div>
+          <div>
+            <h3>Magnitude matching 的双刃剑</h3>
+            <p>它能阻止候选仅靠增大整体梯度“作弊”，但也会把稀疏 action 放大到危险尺度。未来不能只匹配 mean absolute advantage，还需同时约束 active ratio、max token gradient mass、scale cap 与 group-wise concentration。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="rounds">
+        <p class="section-kicker">06 · Four-round evidence</p>
+        <h2>四轮搜索揭示的不是“哪个 feature 最好”，而是什么样的结构更可学习。</h2>
+
+        <div class="timeline">
+          <article class="round">
+            <div><span class="round-id">ROUND 000</span><strong class="round-name">Reliable Disagreement Router</strong></div>
+            <p>保留 Fixed OPD support direction，用 teacher reliability、JSD、student overconfidence 与 tail stability 做有界 token credit reallocation。机制活跃、ESS 健康，成为 champion。</p>
+            <div class="score positive"><strong>+0.729 pp</strong><span>100-step confirmation</span></div>
+          </article>
+          <article class="round">
+            <div><span class="round-id">ROUND 001</span><strong class="round-name">First Error Onset Credit</strong></div>
+            <p>累计 hazard 在长响应中快速饱和，约 96.5% token priority 变为 0；经过均值归一化后几乎退化为 uniform Fixed OPD。</p>
+            <div class="score negative"><strong>−0.729 pp</strong><span>100-step confirmation</span></div>
+          </article>
+          <article class="round">
+            <div><span class="round-id">ROUND 002</span><strong class="round-name">Fixed Pareto Consensus Bridge</strong></div>
+            <p>在 Fixed OPD 上叠加零和 support residual。10-step 明显负，但 100-step 两个 seed 均小幅正，直接证明统一短 probe 会误判 action family。</p>
+            <div class="score positive"><strong>+0.417 pp</strong><span>probe 为 −5.000 pp</span></div>
+          </article>
+          <article class="round">
+            <div><span class="round-id">ROUND 003</span><strong class="round-name">Outcome-safe Reliable Switch</strong></div>
+            <p>约 90% token 被 neutralize，runtime 将剩余 action 放大 11.86 倍；两个 training seed 方向相反，说明稀疏 gate 与 scale matching 存在交互风险。</p>
+            <div class="score negative"><strong>−0.208 pp</strong><span>seed directions disagree</span></div>
+          </article>
+        </div>
+
+        <div class="callout">
+          <div class="callout-index">→</div>
+          <div>
+            <h3>从四轮结果得到的搜索 prior</h3>
+            <p><strong>优先搜索“保留稳定 base objective + 有界残差/路由”</strong>，而不是直接替换完整 support objective 或执行大比例 hard kill。激进 action 仍可探索，但必须进入独立的风险预算与更长 probe。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="diagnosis">
+        <p class="section-kicker">07 · Diagnosis</p>
+        <h2>当前 pipeline 的九个主要瓶颈</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>优先级</th><th>问题</th><th>当前后果</th><th>优化方向</th></tr></thead>
+            <tbody>
+              <tr><td><span class="priority p0">P0</span></td><td><strong>搜索源码与运行状态缺失</strong></td><td>main 无法复现四轮搜索，也无法验证任何 pipeline 修改。</td><td>同步源码、candidate、state、manifest、最小 recorded batch 与 lineage。</td></tr>
+              <tr><td><span class="priority p0">P0</span></td><td><strong>基础设施失败未与算法失败分离</strong></td><td>同一个 union-support device bug 跨轮重复出现，浪费搜索预算。</td><td>结构化 failure taxonomy，并在生成前检索 open infrastructure blockers。</td></tr>
+              <tr><td><span class="priority p0">P0</span></td><td><strong>Selection metric 与研究目标错位</strong></td><td>计划写 pass@16，实际 winner 使用 rollout mean paired delta。</td><td>冻结 primary metric；同时报告 mean、pass@k 与成本，禁止隐式替换。</td></tr>
+              <tr><td><span class="priority p1">P1</span></td><td><strong>Feature lifecycle 分散</strong></td><td>student entropy 在 joint gate 使用前被释放；不同 action 自行重算 feature。</td><td>建立一次生产、版本化定义、显式 device/dtype 的 FeatureBundle。</td></tr>
+              <tr><td><span class="priority p1">P1</span></td><td><strong>Smoke 只检查 finite</strong></td><td>First Error Onset 与 Outcome Switch 都“通过”，但机制已退化或极端稀疏。</td><td>新增机制活性门槛：active ratio、variance、quantile、scale、gradient concentration。</td></tr>
+              <tr><td><span class="priority p1">P1</span></td><td><strong>统一 10-step probe</strong></td><td>Support-level candidate 出现 −5 pp → +0.417 pp 的排名反转。</td><td>按 action family 使用不同 fidelity schedule，并用 sequential racing 分配预算。</td></tr>
+              <tr><td><span class="priority p1">P1</span></td><td><strong>Action runtime 与训练实现强耦合</strong></td><td>support、divergence、gate、route 混在 actor worker 大函数，组合和验证困难。</td><td>拆分 support adapter、feature plane、objective、normalizer 和 diagnostics。</td></tr>
+              <tr><td><span class="priority p2">P2</span></td><td><strong>经验压缩丢失因果信息</strong></td><td>只保留简化 symptom，generator 不知道失败在哪一层、为何失败。</td><td>保留阶段、exception、mechanism state、修复状态及可复用结论。</td></tr>
+              <tr><td><span class="priority p2">P2</span></td><td><strong>搜索状态审计不一致</strong></td><td>patience=2，但最终记录连续 3 轮无提升；恢复行为无法完整解释。</td><td>事件溯源式 state log；每次 resume 记录 code/config/state hash。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="target">
+        <p class="section-kicker">08 · Target architecture</p>
+        <h2>把 evolve 从“生成 loss 的脚本”升级为六层研究系统</h2>
+        <p class="section-lede">核心设计原则是：feature、action、验证、搜索、实验和 memory 分层，每层都输出可冻结、可 hash、可重放的 artifact。</p>
+
+        <div class="architecture">
+          <div class="layer"><div class="layer-title">01 · Feature Plane<span>feature contract</span></div><div class="layer-desc">集中生产 teacher/student distribution features、outcome、region、history 与 support statistics；定义 shape、mask、device、stop-gradient 和版本。</div><div class="layer-output">FeatureBundle + availability manifest</div></div>
+          <div class="layer"><div class="layer-title">02 · Action Runtime<span>candidate ABI</span></div><div class="layer-desc">Candidate 只选择 support objective、bounded residual、token gate/weight 与 active mask；runtime 负责 canonicalization、projection、fallback 和 scale policy。</div><div class="layer-output">ActionOutput + mechanism metrics</div></div>
+          <div class="layer"><div class="layer-title">03 · Validation Gate<span>mechanism-aware</span></div><div class="layer-desc">除 schema、AST、finite 之外，检查 action 是否真的区别于 parent、是否过稀疏、是否依赖缺失输入、是否触发异常 scale 或 device transfer。</div><div class="layer-output">typed verdict + failure class</div></div>
+          <div class="layer"><div class="layer-title">04 · Search Controller<span>multi-fidelity</span></div><div class="layer-desc">先生成假设，再独立 rank；依据 action family、uncertainty、novelty 和基础设施风险分配 smoke、probe 与 confirmation 预算。</div><div class="layer-output">candidate queue + budget policy</div></div>
+          <div class="layer"><div class="layer-title">05 · Experiment &amp; Eval<span>matched evidence</span></div><div class="layer-desc">Matched baseline、training seeds、evaluation seeds、manifest 和逐题配对统计；primary metric 在搜索前冻结。</div><div class="layer-output">paired evidence package</div></div>
+          <div class="layer"><div class="layer-title">06 · Research Memory<span>append-only</span></div><div class="layer-desc">保存设计动机、parent、代码 hash、机制状态、失败阶段、uncertainty 与下一步建议；同一批候选读取同一 snapshot。</div><div class="layer-output">versioned memory snapshot</div></div>
+        </div>
+
+        <div class="principles">
+          <article class="principle"><h3>可复现</h3><p>任一 champion 都能从 commit、manifest、candidate hash 和 seed 重新执行。</p></article>
+          <article class="principle"><h3>机制活跃</h3><p>候选不仅 finite，还必须证明预期 gate、residual 或 support change 真正发生。</p></article>
+          <article class="principle"><h3>预算匹配</h3><p>不同 action family 采用不同 horizon；不让短期 proxy 垄断长期研究决策。</p></article>
+          <article class="principle"><h3>目标一致</h3><p>搜索、early stop、champion selection 和最终论文指标使用同一预注册语义。</p></article>
+        </div>
+      </section>
+
+      <section id="joint-gate">
+        <p class="section-kicker">09 · Multi-feature gating</p>
+        <h2>Teacher confidence × Student entropy：先做可证伪联合门控，不直接上黑盒 MLP。</h2>
+        <p class="section-lede">单 feature 不显著并不等价于联合信号无效。合理假设是：teacher confidence 表示监督可靠性，student entropy 表示学生不确定性；只有二者组合才定义“值得学且可学”的区域。</p>
+
+        <div class="gate-formulas">
+          <article class="formula">
+            <span class="card-number">G1 · ADDITIVE</span>
+            <h3>可解释线性门控</h3>
+            <code>g = sigmoid(a·z(conf_T) + b·z(ent_S) + c)</code>
+            <p>先回答两个 feature 是否提供互补排序；参数少，易做 sign flip、shuffle 和 calibration。</p>
+          </article>
+          <article class="formula">
+            <span class="card-number">G2 · INTERACTION</span>
+            <h3>显式交互门控</h3>
+            <code>g = sigmoid(a·z(conf_T) + b·z(ent_S) + d·z(conf_T)·z(ent_S) + c)</code>
+            <p>直接检验“高可靠 teacher × 高不确定 student”是否是独立于两个主效应的有效区域。</p>
+          </article>
+          <article class="formula">
+            <span class="card-number">G3 · SAFE RESIDUAL</span>
+            <h3>保留 Fixed OPD 的残差式 routing</h3>
+            <code>w = 1 + λ·bounded_priority(conf_T, ent_S)</code>
+            <p>延续当前 champion 的成功 prior：不改变 base support direction，只在受控范围内重分配 credit。</p>
+          </article>
+        </div>
+
+        <h3 style="margin-top:34px">建议最小实验矩阵</h3>
+        <div class="matrix">
+          <div class="matrix-item"><span class="matrix-id">B0</span><div><strong>Fixed OPD</strong><span>同 seed、同起点、同总梯度预算。</span></div></div>
+          <div class="matrix-item"><span class="matrix-id">B1</span><div><strong>Teacher confidence only</strong><span>复现单 feature 结论，作为联合增益的 matched control。</span></div></div>
+          <div class="matrix-item"><span class="matrix-id">B2</span><div><strong>Student entropy only</strong><span>明确方向并验证 feature lifecycle 正确。</span></div></div>
+          <div class="matrix-item"><span class="matrix-id">J1</span><div><strong>Additive joint gate</strong><span>主效应组合，不含 interaction。</span></div></div>
+          <div class="matrix-item"><span class="matrix-id">J2</span><div><strong>Interaction joint gate</strong><span>检验联合区域是否带来额外收益。</span></div></div>
+          <div class="matrix-item"><span class="matrix-id">N1</span><div><strong>Shuffled / mismatched controls</strong><span>保持边际分布与总权重，只破坏 token 对齐。</span></div></div>
+        </div>
+
+        <div class="callout">
+          <div class="callout-index">✓</div>
+          <div>
+            <h3>联合门控的通过标准</h3>
+            <p>联合方法应同时满足：优于最强单 feature；相对 shuffled control 有稳定差异；两个 training seeds 方向一致；gate 不塌缩为常数或极端 0/1；mean weight、active token budget 和 pre-clip gradient mass 与 baseline 可比。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="roadmap">
+        <p class="section-kicker">10 · Optimization roadmap</p>
+        <h2>建议按“恢复—校验—重构—搜索—扩展”推进</h2>
+
+        <div class="roadmap">
+          <article class="phase"><span class="phase-tag">PHASE 0</span><h3>恢复可复现状态</h3><p>同步 search 源码、历史 candidates、state、manifest 和最小 recorded batch；复现 champion identity。</p><div class="phase-out">出口：一条命令重放 round 000</div></article>
+          <article class="phase"><span class="phase-tag">PHASE 1</span><h3>补机制验收</h3><p>加入 active ratio、gate variance、support delta、scale cap、gradient concentration 和 failure taxonomy。</p><div class="phase-out">出口：退化 candidate 在 GPU probe 前被识别</div></article>
+          <article class="phase"><span class="phase-tag">PHASE 2</span><h3>分层 action runtime</h3><p>建立 FeatureBundle、support adapter、objective、normalizer 与 diagnostics 的稳定边界。</p><div class="phase-out">出口：joint gate 与 union support 可独立测试</div></article>
+          <article class="phase"><span class="phase-tag">PHASE 3</span><h3>升级搜索策略</h3><p>独立 hypothesis ranker、action-family-aware horizon、sequential racing 和目标一致 selection。</p><div class="phase-out">出口：预算去向可解释、可复盘</div></article>
+          <article class="phase"><span class="phase-tag">PHASE 4</span><h3>联合 feature 实验</h3><p>先 additive / interaction / safe residual，再决定是否需要小型 learned gate。</p><div class="phase-out">出口：明确联合信号是否真实存在</div></article>
+        </div>
+
+        <div class="callout warn">
+          <div class="callout-index">≠</div>
+          <div>
+            <h3>暂不建议</h3>
+            <p>暂不建议直接把所有 feature 输入 MLP、直接启用 forward kill、或让 Codex 同时修改 optimizer/rollout/evaluation。当前独立实验数量不足以支撑黑盒 gate，且会让收益无法归因。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="gates">
+        <p class="section-kicker">11 · Decision gates</p>
+        <h2>每一阶段都应有明确的继续与停止条件</h2>
+
+        <div class="decision-gates">
+          <div class="decision"><span class="decision-id">GATE A</span><p><strong>Reproducibility：</strong>Fixed OPD identity、champion hash、recorded replay 与 1-step GPU smoke 可重放。</p><div class="decision-out">失败 → 不开始新搜索</div></div>
+          <div class="decision"><span class="decision-id">GATE B</span><p><strong>Mechanism activity：</strong>候选与 parent 存在实质 diff，且 gate/residual/support 统计落在预注册健康范围。</p><div class="decision-out">失败 → repair 或淘汰</div></div>
+          <div class="decision"><span class="decision-id">GATE C</span><p><strong>Proxy validity：</strong>该 action family 的短预算排序能预测更长 horizon，或 uncertainty 足以支持继续 racing。</p><div class="decision-out">失败 → 延长 probe / 改 proxy</div></div>
+          <div class="decision"><span class="decision-id">GATE D</span><p><strong>Research evidence：</strong>matched seeds、paired CI、负对照和机制解释共同支持收益。</p><div class="decision-out">失败 → 不写入 champion 结论</div></div>
+        </div>
+
+        <div class="cards">
+          <article class="card"><span class="card-number">NEXT MEETING · 1</span><h3>源码在哪里？</h3><p>确认 <code>opd_loss_search</code> 的真实分支或机器位置、运行 commit 与是否包含未提交 patch。</p></article>
+          <article class="card"><span class="card-number">NEXT MEETING · 2</span><h3>Primary metric 是什么？</h3><p>在 rollout mean、pass@k、cost-adjusted score 之间做一次明确冻结，避免 winner 语义漂移。</p></article>
+          <article class="card"><span class="card-number">NEXT MEETING · 3</span><h3>联合 gate 的 falsifier 是什么？</h3><p>预注册 shuffled、sign-flipped、single-feature 与 constant matched controls，而不只比较 Fixed OPD。</p></article>
+        </div>
+      </section>
+
+      <section id="evidence">
+        <p class="section-kicker">12 · Evidence map</p>
+        <h2>本报告对应的仓库证据</h2>
+        <p class="section-lede">这些链接均为相对路径，可在仓库中直接打开。报告中的数值与流程以当前 main@bd16245 为准。</p>
+
+        <div class="evidence-list">
+          <a class="evidence-link" href="records.md"><strong>四轮 evolve 全流程与结果</strong><span>docs/verifier/records.md</span></a>
+          <a class="evidence-link" href="experiment_plan_20260804.md"><strong>Loss Evolving 前期实验协议</strong><span>docs/verifier/experiment_plan_20260804.md</span></a>
+          <a class="evidence-link" href="loss-self-evolving-meeting-update-2026-08-05.md"><strong>Memory / action / early stopping 决策</strong><span>docs/verifier/loss-self-evolving-meeting-update-2026-08-05.md</span></a>
+          <a class="evidence-link" href="ruxin.md"><strong>数学优先的 Token Action-Pair 计划</strong><span>docs/verifier/ruxin.md</span></a>
+          <a class="evidence-link" href="../opd/OPD_token_weighting_implementation_audit.md"><strong>Token feature weighting 实现审计</strong><span>docs/opd/OPD_token_weighting_implementation_audit.md</span></a>
+          <a class="evidence-link" href="paper.md"><strong>OPD loss 与 gating 论文索引</strong><span>docs/verifier/paper.md</span></a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div class="footer-inner">
+      <div><strong>OPD Loss Evolve Pipeline</strong><br>Current state &amp; optimization roadmap</div>
+      <div>Prepared from repository <code>main@bd16245</code><br>2026-08-14 · Asia/Shanghai</div>
+    </div>
+  </footer>
+
+  <script>
+    const progress = document.getElementById('progress');
+    const links = [...document.querySelectorAll('.toc a')];
+    const sections = links.map(link => document.querySelector(link.getAttribute('href'))).filter(Boolean);
+
+    function updateProgress() {
+      const max = document.documentElement.scrollHeight - window.innerHeight;
+      const ratio = max > 0 ? window.scrollY / max : 0;
+      progress.style.width = `${Math.min(100, Math.max(0, ratio * 100))}%`;
+    }
+
+    const observer = new IntersectionObserver(entries => {
+      const visible = entries
+        .filter(entry => entry.isIntersecting)
+        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      links.forEach(link => {
+        link.classList.toggle('active', link.getAttribute('href') === `#${visible.target.id}`);
+      });
+    }, { rootMargin: '-18% 0px -68% 0px', threshold: [0, 0.2, 0.5] });
+
+    sections.forEach(section => observer.observe(section));
+    window.addEventListener('scroll', updateProgress, { passive: true });
+    updateProgress();
+  </script>
+</body>
+</html>
