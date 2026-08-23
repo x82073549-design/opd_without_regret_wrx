@@ -49,6 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.opd_variants import PruneOPDLengthController, apply_g_opd_reward
 from verl.trainer.ppo.oracle_ra_opd import OracleRAOPDHelper
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -574,6 +575,10 @@ class RayPPOTrainer:
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
         self.use_rm = need_reward_model(self.role_worker_mapping)
         self.use_critic = need_critic(self.config)
+        g_opd_config = self.config.algorithm.get("g_opd", {}) or {}
+        if bool(g_opd_config.get("enable", False)) and not self.use_rm:
+            raise ValueError("G-OPD requires reward_model.enable=True for teacher top-k scoring")
+        self.prune_opd_length_controller = self._create_prune_opd_length_controller()
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -593,6 +598,37 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _create_prune_opd_length_controller(self) -> Optional[PruneOPDLengthController]:
+        overlap_config = self.config.algorithm.get("overlap_route_opd", None)
+        if overlap_config is None or not bool(overlap_config.get("enable", False)):
+            return None
+        if overlap_config.get("mode", "prune_opd") != "prune_opd":
+            return None
+
+        dynamic_config = overlap_config.get("dynamic_length", None)
+        if dynamic_config is None or not bool(dynamic_config.get("enable", False)):
+            return None
+        if self.config.actor_rollout_ref.rollout.mode != "sync":
+            raise ValueError("Prune-OPD dynamic length currently requires synchronous rollout mode")
+
+        configured_max_length = int(self.config.data.max_response_length)
+        dynamic_max_length = int(dynamic_config.get("max", configured_max_length))
+        if dynamic_max_length > configured_max_length:
+            raise ValueError(
+                "Prune-OPD dynamic_length.max cannot exceed data.max_response_length; "
+                "the latter reserves the rollout/model tensor capacity"
+            )
+        return PruneOPDLengthController(
+            initial_length=int(dynamic_config.get("initial", 1024)),
+            min_length=int(dynamic_config.get("min", 1024)),
+            max_length=dynamic_max_length,
+            step=int(dynamic_config.get("step", 100)),
+            margin=int(dynamic_config.get("margin", 100)),
+            hit_ratio_threshold=float(dynamic_config.get("hit_ratio_threshold", 0.1)),
+            shrink_patience=int(dynamic_config.get("shrink_patience", 3)),
+            epsilon=float(dynamic_config.get("epsilon", 1e-6)),
+        )
 
     def _get_oracle_ra_opd_helper(self, oracle_config: dict):
         if self._oracle_ra_opd_helper is None:
@@ -1086,6 +1122,9 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        if self.prune_opd_length_controller is not None:
+            controller_path = os.path.join(local_global_step_folder, "prune_opd_length_controller.pt")
+            torch.save(self.prune_opd_length_controller.state_dict(), controller_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
@@ -1153,6 +1192,14 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        if self.prune_opd_length_controller is not None:
+            controller_path = os.path.join(global_step_folder, "prune_opd_length_controller.pt")
+            if os.path.exists(controller_path):
+                controller_state = torch.load(controller_path, weights_only=True)
+                self.prune_opd_length_controller.load_state_dict(controller_state)
+            else:
+                print("Warning: No Prune-OPD length-controller state found; using configured initial length")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1291,6 +1338,10 @@ class RayPPOTrainer:
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                if self.prune_opd_length_controller is not None:
+                    gen_batch_output.meta_info["response_length"] = (
+                        self.prune_opd_length_controller.current_length
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1358,6 +1409,8 @@ class RayPPOTrainer:
                         overlap_route_enabled = False
                         oracle_ra_opd_enabled = False
                         grpo_gated_opd_enabled = False
+                        g_opd_enabled = False
+                        g_opd = None
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             with marked_timer("compute_log_prob", timing_raw, color="blue"):
@@ -1374,6 +1427,18 @@ class RayPPOTrainer:
                             strategy = self.config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu")
                             kl_estimator = self.config.actor_rollout_ref.rollout.get("kl_estimator", "k1")
                             reward_weight_mode = self.config.actor_rollout_ref.rollout.get("reward_weight_mode", "student_p")
+                            g_opd_cfg = self.config.algorithm.get("g_opd", None)
+                            if g_opd_cfg is not None:
+                                g_opd = OmegaConf.to_container(g_opd_cfg, resolve=True)
+                                g_opd_enabled = bool(g_opd.get("enable", False))
+                            if g_opd_enabled:
+                                if top_k <= 0 or strategy != "only_stu":
+                                    raise ValueError("G-OPD requires log_prob_top_k > 0 and top_k_strategy=only_stu")
+                                reward_scale = float(g_opd.get("reward_scale", 1.25))
+                                if reward_scale <= 0:
+                                    raise ValueError("G-OPD reward_scale must be positive")
+                                if self.ref_in_actor:
+                                    raise ValueError("G-OPD does not support LoRA actor-as-reference")
                             prefix_correction_cfg = self.config.algorithm.get("prefix_correction", None)
                             prefix_correction = None
                             prefix_correction_enabled = False
@@ -1436,6 +1501,14 @@ class RayPPOTrainer:
                                 if outcome_opd_mask_cfg_for_overlap is not None and outcome_opd_mask_cfg_for_overlap.get("enable", False):
                                     raise ValueError("overlap_route_opd should not be combined with outcome_opd_mask")
 
+                            if g_opd_enabled and (
+                                prefix_correction_enabled or ratio_kl_switch_enabled or overlap_route_enabled
+                            ):
+                                raise ValueError(
+                                    "G-OPD should not be combined with prefix_correction, ratio_kl_switch, "
+                                    "or overlap_route_opd"
+                                )
+
                             oracle_ra_opd_cfg = self.config.algorithm.get("oracle_ra_opd", None)
                             oracle_ra_opd = None
                             oracle_ra_opd_enabled = False
@@ -1492,6 +1565,13 @@ class RayPPOTrainer:
                                 raise ValueError(
                                     "sampled_token_gate_opd and topk_token_gate_opd should not be enabled together"
                                 )
+                            if g_opd_enabled and (
+                                oracle_ra_opd_enabled
+                                or grpo_gated_opd_enabled
+                                or sampled_token_gate_opd_enabled
+                                or topk_token_gate_opd_enabled
+                            ):
+                                raise ValueError("G-OPD cannot be combined with another OPD gate/router")
 
                             sampled_gate_for_reward = None
                             if sampled_token_gate_opd_enabled:
@@ -1609,6 +1689,23 @@ class RayPPOTrainer:
                                 with marked_timer("compute_distillation_reward", timing_raw, color="orange"):
                                     distillation_output = self.actor_rollout_wg.compute_distillation_reward(batch)
                                     batch = batch.union(distillation_output)
+
+                                if self.prune_opd_length_controller is not None:
+                                    raw_weight = batch.batch.get("overlap_route_raw_weight", None)
+                                    if raw_weight is None:
+                                        raise ValueError(
+                                            "Prune-OPD dynamic length requires overlap_route_raw_weight"
+                                        )
+                                    length_metrics = self.prune_opd_length_controller.update(
+                                        raw_weight=raw_weight,
+                                        response_mask=batch.batch["response_mask"],
+                                    )
+                                    metrics.update(
+                                        {
+                                            f"prune_opd/dynamic_{name}": value
+                                            for name, value in length_metrics.items()
+                                        }
+                                    )
 
                                 if topk_gate_for_reward is not None:
                                     try:
@@ -2080,8 +2177,16 @@ class RayPPOTrainer:
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
+                    if g_opd_enabled:
+                        with marked_timer("g_opd_reference_log_prob", timing_raw, color="olive"):
+                            reference_top_k_log_prob = self.ref_policy_wg.compute_ref_log_probs_for_ids(batch)
+                            batch = batch.union(reference_top_k_log_prob)
+
+                    needs_sampled_reference = (
+                        self.config.algorithm.use_kl_in_reward
+                        or self.config.actor_rollout_ref.actor.use_kl_loss
+                    )
+                    if needs_sampled_reference:
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
@@ -2100,6 +2205,36 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        if g_opd_enabled:
+                            reward_device = reward_tensor.device
+                            student_log_probs = batch.batch["student_top_k_log_probs"].to(reward_device)
+                            teacher_log_probs = batch.batch["teacher_on_student_log_probs"].to(reward_device)
+                            reference_log_probs = batch.batch["reference_on_student_log_probs"].to(reward_device)
+                            candidate_mask = batch.batch.get("opd_candidate_kl_mask", None)
+                            if candidate_mask is not None:
+                                candidate_mask = candidate_mask.to(reward_device)
+                            reward_tensor, g_opd_correction = apply_g_opd_reward(
+                                base_rewards=reward_tensor,
+                                student_log_probs=student_log_probs,
+                                teacher_log_probs=teacher_log_probs,
+                                reference_log_probs=reference_log_probs,
+                                reward_scale=float(g_opd.get("reward_scale", 1.25)),
+                                reward_weight_mode=reward_weight_mode,
+                                candidate_mask=candidate_mask,
+                            )
+                            response_mask = batch.batch["response_mask"].to(reward_device).float()
+                            candidate_count = g_opd_correction.shape[-1]
+                            correction_mask = response_mask.unsqueeze(-1).expand_as(g_opd_correction)
+                            correction_denom = correction_mask.sum().clamp_min(1.0)
+                            metrics["g_opd/reward_scale"] = float(g_opd.get("reward_scale", 1.25))
+                            metrics["g_opd/correction_mean"] = (
+                                (g_opd_correction.float() * correction_mask).sum() / correction_denom
+                            ).item()
+                            metrics["g_opd/correction_abs_mean"] = (
+                                (g_opd_correction.float().abs() * correction_mask).sum() / correction_denom
+                            ).item()
+                            metrics["g_opd/top_k"] = float(candidate_count)
+                            batch.batch["rm_scores"] = reward_tensor
                         batch.batch["token_level_scores"] = reward_tensor
 
                         has_explicit_true_reward_score = "true_reward_score" in reward_extra_infos_dict

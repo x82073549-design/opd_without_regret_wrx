@@ -225,10 +225,20 @@ class TaskRunner:
                 self.mapping[Role.RewardModel] = "global_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Add reference policy worker if KL loss or KL reward is used."""
+        """Add reference policy worker if KL regularization or G-OPD uses it."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        g_opd_config = config.algorithm.get("g_opd", {}) or {}
+        if bool(g_opd_config.get("enable", False)) and config.actor_rollout_ref.actor.strategy not in {
+            "fsdp",
+            "fsdp2",
+        }:
+            raise NotImplementedError("G-OPD reference-candidate scoring currently requires the FSDP backend")
+        if (
+            config.algorithm.use_kl_in_reward
+            or config.actor_rollout_ref.actor.use_kl_loss
+            or bool(g_opd_config.get("enable", False))
+        ):
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
@@ -264,7 +274,7 @@ class TaskRunner:
         # The reward type depends on the tag of the data
         self.add_reward_model_worker(config)
 
-        # Add a reference policy worker if KL loss or KL reward is used.
+        # Add a reference policy worker if KL regularization or G-OPD uses it.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
         # validate config

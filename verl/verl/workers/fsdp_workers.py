@@ -1110,6 +1110,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="ref_compute_log_probs_for_ids")
+    def compute_ref_log_probs_for_ids(self, data: DataProto):
+        """Compute reference log-probabilities on the student's top-k candidates for G-OPD."""
+        if self._is_lora:
+            raise NotImplementedError("G-OPD reference-candidate scoring does not support LoRA actor-as-reference")
+        assert self._is_ref
+        if "student_top_k_ids" not in data.batch.keys():
+            raise ValueError("G-OPD requires student_top_k_ids")
+
+        data.batch["target_ids"] = data.batch["student_top_k_ids"]
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            output = self.ref_policy.compute_log_probs_for_ids(data=data)
+            output = DataProto.from_dict(tensors={"reference_on_student_log_probs": output})
+
+        output = output.to("cpu")
+        if self.world_size > 1:
+            if fsdp_version(self.ref_policy.actor_module) == 1:
+                self.ref_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.ref_policy.actor_module) == 2:
+                self.ref_policy.actor_module.reshard()
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank

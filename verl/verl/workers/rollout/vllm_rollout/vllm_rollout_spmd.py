@@ -365,6 +365,12 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        train_response_length = int(prompts.meta_info.get("response_length", self.config.response_length))
+        if train_response_length <= 0 or train_response_length > self.config.response_length:
+            raise ValueError(
+                "Per-call response_length must be in (0, configured rollout.response_length], "
+                f"got {train_response_length} with configured maximum {self.config.response_length}"
+            )
         if is_validate:
             # Validation must honor val_kwargs.max_tokens even for greedy decoding.
             # Checking `not do_sample` first silently falls back to training response_length.
@@ -398,7 +404,10 @@ class vLLMRollout(BaseRollout):
                 "min_p": 0.0,
                 "temperature": 0,
                 "n": 1,  # if greedy, only 1 response
+                "max_tokens": train_response_length,
             }
+        else:
+            kwargs["max_tokens"] = train_response_length
         
             
 
@@ -409,7 +418,7 @@ class vLLMRollout(BaseRollout):
             val_max_tokens = self.config.val_kwargs.get("max_tokens", self.config.response_length)
             padding_max_length = val_max_tokens
         else:
-            padding_max_length = self.config.response_length
+            padding_max_length = train_response_length
 
         lora_requests = None
         if self.lora_kwargs:
