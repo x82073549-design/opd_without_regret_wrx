@@ -113,7 +113,7 @@ class PruneOPDLengthController:
         valid_mask = response_mask.to(device=raw_weight.device, dtype=torch.bool)
         effective_lengths = ((raw_weight > self.epsilon) & valid_mask).sum(dim=-1)
         used_length = self.current_length
-        hit_boundary = max(used_length - self.margin, 0)
+        hit_boundary = max(self.min_length, used_length - self.margin)
         hit_ratio = (effective_lengths >= hit_boundary).float().mean().item()
 
         if hit_ratio >= self.hit_ratio_threshold:

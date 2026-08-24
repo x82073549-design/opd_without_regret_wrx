@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Self-contained local launcher for Qwen3-4B fixed OPD on two A800 80G GPUs.
+# Self-contained local launcher for Qwen3-4B fixed OPD on two A100 80G GPUs.
 #
 # Usage:
 #   bash opd_4b.sh [formal|benchmark|smoke|config] [seed]
@@ -18,13 +18,14 @@ cd "$ROOT_DIR"
 # ---------------------------------------------------------------------------
 # Local environment and storage
 # ---------------------------------------------------------------------------
-CONDA_ENV_PREFIX=${CONDA_ENV_PREFIX:-/data1/ruxin/conda_envs/opd_env}
-PHYSICAL_GPUS=${PHYSICAL_GPUS:-1,0}
-OUTPUT_ROOT=${OUTPUT_ROOT:-/home/ruxinwang/OPD-without-regret/outputs/qwen3_4b_co_distillation_baseline}
-HF_HOME=${HF_HOME:-/data0/models}
-HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-/data0/datasets}
+# These defaults match the current A100 host.  They remain overridable for a
+# different conda environment, scheduler allocation, or output volume.
+CONDA_ENV_PREFIX=${CONDA_ENV_PREFIX:-/ssd/data/wangruxin/envs/wrx_env}
+PHYSICAL_GPUS=${PHYSICAL_GPUS:-0,1}
+OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT_DIR/outputs}
+HF_HOME=${HF_HOME:-/ssd/data/wangruxin/hf_cache}
+HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
 
-# ---------------------------------------------------------------------------
 # Run mode
 # ---------------------------------------------------------------------------
 RUN_MODE=${1:-formal}
@@ -35,11 +36,13 @@ BENCHMARK_REWARD_MICRO_BATCH_SIZE=${4:-1}
 # ---------------------------------------------------------------------------
 # Models and data
 # ---------------------------------------------------------------------------
-ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-/data0/models/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}
-REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-/data0/models/hub/models--Keven16--Qwen3-4B-Non-Thinking-RL-Math-Step500/snapshots/05d82d02780d4a6f8295b2909dbbd89e8a8b5aaa}
+ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-/ssd/data/wangruxin/hf_cache/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B/snapshots/ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562}
+REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-/ssd/data/wangruxin/hf_cache/models--hbx--JustRL-DeepSeek-1.5B/snapshots/0637e4096c789c67f9eecbe8355e0bdeddede1c2}
 TRAIN_DATASET=${TRAIN_DATASET:-datasets/dapo-math-17k.parquet}
-TRAIN_DATASET_NAME=${TRAIN_DATASET_NAME:-DAPO-Math-17k-opd-2gpu-80g}
-TEST_DATASET=${TEST_FILE:-[scripts/val/data_verl/AIME24/test.parquet,scripts/val/data_verl/AIME25/test.parquet,scripts/val/data_verl/AMC23/test.parquet]}
+VAL_SOURCE_DATA_DIR=${VAL_SOURCE_DATA_DIR:-scripts/val/data}
+TEST_DATA_DIR=${TEST_DATA_DIR:-scripts/val/data_verl}
+TEST_DATASET=${TEST_FILE:-["$TEST_DATA_DIR/AIME25/test.parquet", "$TEST_DATA_DIR/AMC23/test.parquet", "$TEST_DATA_DIR/AIME24/test.parquet"]}
+PREPARE_VAL_DATA=${PREPARE_VAL_DATA:-True}
 
 # ---------------------------------------------------------------------------
 # Fixed OPD objective
@@ -92,7 +95,8 @@ N_RESPONSES=${N_RESPONSES:-4}
 TEMPERATURE=${TEMPERATURE:-1.0}
 TEACHER_TEMPERATURE=${TEACHER_TEMPERATURE:-1.0}
 REPETITION_PENALTY=${REPETITION_PENALTY:-1.0}
-ENABLE_THINKING=${ENABLE_THINKING:-False}
+# An explicitly empty value suppresses this optional chat-template argument.
+ENABLE_THINKING=${ENABLE_THINKING-False}
 MODEL_DTYPE=${MODEL_DTYPE:-bfloat16}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.50}
 VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-True}
@@ -128,7 +132,8 @@ TRAINER_LOGGER=${TRAINER_LOGGER:-"['console','wandb']"}
 WANDB_MODE=${WANDB_MODE:-offline}
 IS_PLOT=${IS_PLOT:-False}
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-24}
-SKIP_GPU_BUSY_CHECK=${SKIP_GPU_BUSY_CHECK:-False}
+GPU_NAME_PATTERN=${GPU_NAME_PATTERN:-A100}
+GPU_MIN_MEMORY_MIB=${GPU_MIN_MEMORY_MIB:-80000}
 ACTOR_USE_REMOVE_PADDING=${ACTOR_USE_REMOVE_PADDING:-True}
 REWARD_USE_REMOVE_PADDING=${REWARD_USE_REMOVE_PADDING:-True}
 CHECKPOINT_SAVE_CONTENTS=${CHECKPOINT_SAVE_CONTENTS:-model,optimizer,extra}
@@ -223,6 +228,25 @@ for required_path in "$ACTOR_MODEL_PATH/config.json" "$REWARD_MODEL_PATH/config.
     fi
 done
 
+# Keep validation prompts consistent with the OPD math evaluation protocol.
+# This writes prepared copies under TEST_DATA_DIR and leaves the source data
+# under VAL_SOURCE_DATA_DIR unchanged.
+if [ "$PREPARE_VAL_DATA" = True ]; then
+    python3 scripts/val/prepare_verl_validation_data.py \
+        --source-dir "$VAL_SOURCE_DATA_DIR" \
+        --output-dir "$TEST_DATA_DIR" \
+        --tasks AIME25 AMC23 AIME24
+fi
+for required_path in \
+    "$TEST_DATA_DIR/AIME25/test.parquet" \
+    "$TEST_DATA_DIR/AMC23/test.parquet" \
+    "$TEST_DATA_DIR/AIME24/test.parquet"; do
+    if [ ! -f "$required_path" ]; then
+        echo "Missing required validation artifact: $required_path" >&2
+        exit 2
+    fi
+done
+
 if [ "$RUN_MODE" != config ]; then
     for gpu in "${GPU_IDS[@]}"; do
         if ! [[ "$gpu" =~ ^[0-9]+$ ]]; then
@@ -231,13 +255,8 @@ if [ "$RUN_MODE" != config ]; then
         fi
         gpu_name=$(nvidia-smi -i "$gpu" --query-gpu=name --format=csv,noheader | tr -d '\r')
         gpu_mem=$(nvidia-smi -i "$gpu" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d '[:space:]')
-        if [[ "$gpu_name" != *A800* ]] || [ "$gpu_mem" -lt 80000 ]; then
-            echo "GPU $gpu does not satisfy the A800 80G requirement: name=$gpu_name memory=${gpu_mem}MiB" >&2
-            exit 2
-        fi
-        active_pids=$(nvidia-smi -i "$gpu" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d '[:space:]')
-        if [ "$SKIP_GPU_BUSY_CHECK" != True ] && [ -n "$active_pids" ]; then
-            echo "GPU $gpu is not free; active PIDs: $active_pids" >&2
+        if [[ "$gpu_name" != *"$GPU_NAME_PATTERN"* ]] || [ "$gpu_mem" -lt "$GPU_MIN_MEMORY_MIB" ]; then
+            echo "GPU $gpu does not satisfy the ${GPU_NAME_PATTERN} ${GPU_MIN_MEMORY_MIB}MiB requirement: name=$gpu_name memory=${gpu_mem}MiB" >&2
             exit 2
         fi
     done
@@ -266,7 +285,17 @@ WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-$RUN_ROOT/wandb_cache}
 WANDB_CONFIG_DIR=${WANDB_CONFIG_DIR:-$RUN_ROOT/wandb_config}
 WANDB_ARTIFACT_DIR=${WANDB_ARTIFACT_DIR:-$RUN_ROOT/wandb_artifacts}
 OUTLINES_CACHE_DIR=${OUTLINES_CACHE_DIR:-$RUN_ROOT/outlines_cache/$RUN_ID}
-RAY_TMP_DIR=${RAY_TMP_DIR:-/data1/ruxin/rt/q4rm/${RUN_MODE:0:1}${TRAINING_SEED}}
+RAY_LOG_ROOT=${RAY_LOG_ROOT:-$RUN_ROOT/logs/ray}
+RAY_RUN_STAMP=$(date +%Y%m%d_%H%M%S)
+RAY_STORE_DIR=${RAY_STORE_DIR:-$RAY_LOG_ROOT/ray_store_${RAY_RUN_STAMP}}
+RAY_SHORT_TMP_DIR=${RAY_SHORT_TMP_DIR:-/tmp/opd_${RAY_RUN_STAMP}}
+if [ -e "$RAY_SHORT_TMP_DIR" ] && [ ! -L "$RAY_SHORT_TMP_DIR" ]; then
+    echo "RAY_SHORT_TMP_DIR exists and is not a symlink: $RAY_SHORT_TMP_DIR" >&2
+    exit 2
+fi
+mkdir -p "$RAY_STORE_DIR"
+ln -sfn "$RAY_STORE_DIR" "$RAY_SHORT_TMP_DIR"
+RAY_TMP_DIR=${RAY_TMP_DIR:-$RAY_SHORT_TMP_DIR}
 TMPDIR=${TMPDIR:-$RAY_TMP_DIR/tmp}
 export PROJECT_PATH CKPT_PATH VALIDATION_DATA_DIR LOG_ROOT LOG_DIR SWANLAB_LOG_DIR
 export WANDB_DIR WANDB_CACHE_DIR WANDB_CONFIG_DIR WANDB_ARTIFACT_DIR
@@ -339,6 +368,10 @@ if [ "$PRUNE_OPD_ENABLE" = True ]; then
         +algorithm.overlap_route_opd.dynamic_length.epsilon="$PRUNE_OPD_DYNAMIC_EPSILON"
     )
 fi
+CHAT_TEMPLATE_ARGS=()
+if [ -n "$ENABLE_THINKING" ]; then
+    CHAT_TEMPLATE_ARGS=(+data.apply_chat_template_kwargs.enable_thinking="$ENABLE_THINKING")
+fi
 
 set -x
 set +e
@@ -358,7 +391,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
     data.max_prompt_length="$MAX_PROMPT_LENGTH" \
     data.max_response_length="$MAX_RESP_LENGTH" \
-    +data.apply_chat_template_kwargs.enable_thinking="$ENABLE_THINKING" \
+    "${CHAT_TEMPLATE_ARGS[@]}" \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.return_raw_chat=True \

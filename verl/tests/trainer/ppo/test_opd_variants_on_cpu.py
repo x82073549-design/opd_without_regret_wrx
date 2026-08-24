@@ -65,6 +65,24 @@ def test_prune_opd_length_controller_expands_and_shrinks() -> None:
     assert second_low["next_length"] == 4
 
 
+def test_prune_opd_length_controller_hit_boundary_respects_min_length() -> None:
+    controller = PruneOPDLengthController(
+        initial_length=4,
+        min_length=4,
+        max_length=6,
+        step=1,
+        margin=1,
+        hit_ratio_threshold=0.5,
+    )
+    response_mask = torch.ones((1, 4))
+    raw_weight = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+
+    result = controller.update(raw_weight, response_mask)
+
+    assert result["hit_ratio"] == 0.0
+    assert result["next_length"] == 4
+
+
 def test_prune_opd_length_controller_restores_state() -> None:
     controller = PruneOPDLengthController(initial_length=4, min_length=2, max_length=6)
     controller.load_state_dict({"current_length": 5, "low_hit_steps": 1})
