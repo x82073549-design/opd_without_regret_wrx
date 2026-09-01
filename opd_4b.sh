@@ -20,10 +20,13 @@ cd "$ROOT_DIR"
 # ---------------------------------------------------------------------------
 # These defaults match the current A100 host.  They remain overridable for a
 # different conda environment, scheduler allocation, or output volume.
-CONDA_ENV_PREFIX=${CONDA_ENV_PREFIX:-/ssd/data/wangruxin/envs/wrx_env}
+CONDA_ENV_PREFIX=${CONDA_ENV_PREFIX:-/usr/envs/wrx_env}
 PHYSICAL_GPUS=${PHYSICAL_GPUS:-0,1}
-OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT_DIR/outputs}
-HF_HOME=${HF_HOME:-/ssd/data/wangruxin/hf_cache}
+# Keep the lightweight text logs with the repository; place checkpoints,
+# Ray state, validation generations, and service caches on the data volume.
+LOG_OUTPUT_ROOT=${LOG_OUTPUT_ROOT:-$ROOT_DIR/outputs}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/data/opd_outputs}
+HF_HOME=${HF_HOME:-$OUTPUT_ROOT/cache/huggingface}
 HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
 
 # Run mode
@@ -36,8 +39,8 @@ BENCHMARK_REWARD_MICRO_BATCH_SIZE=${4:-1}
 # ---------------------------------------------------------------------------
 # Models and data
 # ---------------------------------------------------------------------------
-ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-/ssd/data/wangruxin/hf_cache/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B/snapshots/ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562}
-REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-/ssd/data/wangruxin/hf_cache/models--hbx--JustRL-DeepSeek-1.5B/snapshots/0637e4096c789c67f9eecbe8355e0bdeddede1c2}
+ACTOR_MODEL_PATH=${ACTOR_MODEL_PATH:-/data/models/DeepSeek-R1-Distill-Qwen-1.5B}
+REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-/data/models/JustRL-DeepSeek-1.5B}
 TRAIN_DATASET=${TRAIN_DATASET:-datasets/dapo-math-17k.parquet}
 VAL_SOURCE_DATA_DIR=${VAL_SOURCE_DATA_DIR:-scripts/val/data}
 TEST_DATA_DIR=${TEST_DATA_DIR:-scripts/val/data_verl}
@@ -57,6 +60,11 @@ USE_KL=${USE_KL:-False}
 USE_KL_IN_REWARD=${USE_KL_IN_REWARD:-False}
 ENABLE_FORMAT_REWARD=${ENABLE_FORMAT_REWARD:-False}
 LOSS_AGG_MODE=${LOSS_AGG_MODE:-token-mean}
+
+# Entropy-Aware OPD. Disabled for the fixed-OPD baseline.
+EOPD_ENABLE=${EOPD_ENABLE:-False}
+EOPD_ENTROPY_THRESHOLD=${EOPD_ENTROPY_THRESHOLD:-0.8}
+EOPD_FKL_COEF=${EOPD_FKL_COEF:-1.0}
 
 # ExOPD (G-OPD reward extrapolation). Disabled for the baseline.
 G_OPD_ENABLE=${G_OPD_ENABLE:-False}
@@ -109,12 +117,15 @@ ACTOR_PPO_EPOCHS=${ACTOR_PPO_EPOCHS:-1}
 
 # One pass over the 17K training set is 279 optimizer steps with the
 # baseline batch setting.  Validation runs only when that pass completes.
-TRAIN_TOTAL_STEPS=${TRAIN_TOTAL_STEPS:-279}
+TRAIN_TOTAL_STEPS=${TRAIN_TOTAL_STEPS:-280}
 TRAIN_TOTAL_EPOCHS=${TRAIN_TOTAL_EPOCHS:-1}
 SAVE_FREQ=${SAVE_FREQ:-50}
-TEST_FREQ=${TEST_FREQ:-279}
+TEST_FREQ=${TEST_FREQ:-280}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False}
 VAL_ONLY=${VAL_ONLY:-False}
+# Keep validation sampling statistically identical while avoiding a single
+# 100-prompts x VAL_N generation batch on hosts with limited system RAM.
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
 VAL_N=${VAL_N:-4}
 VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.7}
@@ -132,11 +143,19 @@ TRAINER_LOGGER=${TRAINER_LOGGER:-"['console','wandb']"}
 WANDB_MODE=${WANDB_MODE:-offline}
 IS_PLOT=${IS_PLOT:-False}
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-24}
+RAY_INCLUDE_DASHBOARD=${RAY_INCLUDE_DASHBOARD:-False}
+RAY_MEMORY_USAGE_THRESHOLD=${RAY_MEMORY_USAGE_THRESHOLD:-0.99}
 GPU_NAME_PATTERN=${GPU_NAME_PATTERN:-A100}
 GPU_MIN_MEMORY_MIB=${GPU_MIN_MEMORY_MIB:-80000}
 ACTOR_USE_REMOVE_PADDING=${ACTOR_USE_REMOVE_PADDING:-True}
+ACTOR_ENABLE_ACTIVATION_OFFLOAD=${ACTOR_ENABLE_ACTIVATION_OFFLOAD:-False}
+REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-False}
 REWARD_USE_REMOVE_PADDING=${REWARD_USE_REMOVE_PADDING:-True}
-CHECKPOINT_SAVE_CONTENTS=${CHECKPOINT_SAVE_CONTENTS:-model,optimizer,extra}
+# Serializing both FSDP optimizer shards concurrently exceeds the 31 GiB host
+# RAM at checkpoint time.  Model + extra is sufficient for evaluation and
+# avoids that transient CPU-memory spike; opt in to optimizer state explicitly
+# on hosts with more RAM via CHECKPOINT_SAVE_CONTENTS=model,optimizer,extra.
+CHECKPOINT_SAVE_CONTENTS=${CHECKPOINT_SAVE_CONTENTS:-model,extra}
 
 case "$RUN_MODE" in
     formal)
@@ -209,6 +228,9 @@ export HYDRA_FULL_ERROR=1
 export OPD_DETERMINISTIC_TRAINING=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export WANDB_MODE
+# Ray's default 95% threshold counts reclaimable page cache on this 31 GiB
+# host and kills workers even though their combined RSS still fits in RAM.
+export RAY_memory_usage_threshold=$RAY_MEMORY_USAGE_THRESHOLD
 
 if ! [[ "$TRAINING_SEED" =~ ^[0-9]+$ ]]; then
     echo "Seed must be a non-negative integer: $TRAINING_SEED" >&2
@@ -266,18 +288,21 @@ MAX_MODEL_LEN_TRAIN=$((MAX_PROMPT_LENGTH + MAX_RESP_LENGTH))
 MAX_MODEL_LEN_VAL=$((MAX_PROMPT_LENGTH + MAX_VAL_RESP_LENGTH))
 MAX_MODEL_LEN=$((MAX_MODEL_LEN_TRAIN > MAX_MODEL_LEN_VAL ? MAX_MODEL_LEN_TRAIN : MAX_MODEL_LEN_VAL))
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((MAX_MODEL_LEN_TRAIN > 32768 ? MAX_MODEL_LEN_TRAIN : 32768))}
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$((PPO_MAX_TOKEN_LEN_PER_GPU > MAX_MODEL_LEN ? PPO_MAX_TOKEN_LEN_PER_GPU : MAX_MODEL_LEN))}
 
 RUN_ID=${RUN_ID:-${METHOD}_qwen3_4b_non_thinking_rl_math_trainseed${TRAINING_SEED}_${RUN_SUFFIX}}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-$RUN_ID}
 if [ "$RUN_MODE" = formal ]; then
     RUN_ROOT=$OUTPUT_ROOT
+    LOG_RUN_ROOT=$LOG_OUTPUT_ROOT
 else
     RUN_ROOT=$OUTPUT_ROOT/preflight
+    LOG_RUN_ROOT=$LOG_OUTPUT_ROOT/preflight
 fi
 PROJECT_PATH=${PROJECT_PATH:-$RUN_ROOT/run_state}
 CKPT_PATH=${CKPT_PATH:-$PROJECT_PATH/$RUN_ID}
 VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-$RUN_ROOT/validation/$RUN_ID}
-LOG_ROOT=${LOG_ROOT:-$RUN_ROOT/logs/internal}
+LOG_ROOT=${LOG_ROOT:-$LOG_RUN_ROOT/logs/internal}
 LOG_DIR=${LOG_DIR:-$LOG_ROOT/$RUN_ID}
 SWANLAB_LOG_DIR=${SWANLAB_LOG_DIR:-$RUN_ROOT/swanlab}
 WANDB_DIR=${WANDB_DIR:-$RUN_ROOT/wandb}
@@ -301,8 +326,8 @@ export PROJECT_PATH CKPT_PATH VALIDATION_DATA_DIR LOG_ROOT LOG_DIR SWANLAB_LOG_D
 export WANDB_DIR WANDB_CACHE_DIR WANDB_CONFIG_DIR WANDB_ARTIFACT_DIR
 export OUTLINES_CACHE_DIR RAY_TMP_DIR TMPDIR
 
-if [ -e "$CKPT_PATH" ]; then
-    echo "Refusing to reuse existing run directory: $CKPT_PATH" >&2
+if [ -e "$CKPT_PATH" ] && [ "$RESUME_MODE" = disable ]; then
+    echo "Refusing to reuse existing run directory without resume enabled: $CKPT_PATH" >&2
     exit 2
 fi
 mkdir -p "$CKPT_PATH" "$VALIDATION_DATA_DIR" "$LOG_DIR" "$SWANLAB_LOG_DIR" \
@@ -314,7 +339,10 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "Qwen3-4B OPD configuration:"
 echo "  mode=$RUN_MODE seed=$TRAINING_SEED GPUs=$PHYSICAL_GPUS"
-echo "  method=$METHOD g_opd=$G_OPD_ENABLE prune_opd=$PRUNE_OPD_ENABLE"
+echo "  method=$METHOD eopd=$EOPD_ENABLE g_opd=$G_OPD_ENABLE prune_opd=$PRUNE_OPD_ENABLE"
+if [ "$EOPD_ENABLE" = True ]; then
+    echo "  eopd_entropy_threshold=$EOPD_ENTROPY_THRESHOLD eopd_fkl_coef=$EOPD_FKL_COEF"
+fi
 echo "  actor=$ACTOR_MODEL_PATH"
 echo "  teacher=$REWARD_MODEL_PATH"
 echo "  train_batch=$TRAIN_BATCH_SIZE mini_batch=$MINI_BATCH_SIZE responses=$N_RESPONSES"
@@ -335,9 +363,20 @@ RESUME_ARGS=(trainer.resume_mode="$RESUME_MODE")
 if [ -n "$RESUME_FROM_PATH" ]; then
     RESUME_ARGS+=(trainer.resume_from_path="$RESUME_FROM_PATH")
 fi
-if [ "$G_OPD_ENABLE" = True ] && [ "$PRUNE_OPD_ENABLE" = True ]; then
-    echo "G_OPD_ENABLE and PRUNE_OPD_ENABLE are mutually exclusive reproduction variants" >&2
+if { [ "$EOPD_ENABLE" = True ] && [ "$G_OPD_ENABLE" = True ]; } || \
+   { [ "$EOPD_ENABLE" = True ] && [ "$PRUNE_OPD_ENABLE" = True ]; } || \
+   { [ "$G_OPD_ENABLE" = True ] && [ "$PRUNE_OPD_ENABLE" = True ]; }; then
+    echo "EOPD_ENABLE, G_OPD_ENABLE, and PRUNE_OPD_ENABLE are mutually exclusive variants" >&2
     exit 2
+fi
+EOPD_ARGS=()
+if [ "$EOPD_ENABLE" = True ]; then
+    EOPD_ARGS=(
+        +algorithm.eopd.enable=True
+        +algorithm.eopd.entropy_threshold="$EOPD_ENTROPY_THRESHOLD"
+        +algorithm.eopd.fkl_coef="$EOPD_FKL_COEF"
+        +algorithm.eopd.top_k="$LOG_PROB_TOP_K"
+    )
 fi
 G_OPD_ARGS=()
 if [ "$G_OPD_ENABLE" = True ]; then
@@ -380,6 +419,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator="$ADV_ESTIMATOR" \
     algorithm.grpo_outcome_weight="$GRPO_OUTCOME_WEIGHT" \
     algorithm.use_kl_in_reward="$USE_KL_IN_REWARD" \
+    "${EOPD_ARGS[@]}" \
     "${G_OPD_ARGS[@]}" \
     "${PRUNE_OPD_ARGS[@]}" \
     data.shuffle="$DATA_SHUFFLE" \
@@ -389,6 +429,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="$TRAIN_DATASET" \
     data.val_files="$TEST_DATASET" \
     data.train_batch_size="$TRAIN_BATCH_SIZE" \
+    data.val_batch_size="$VAL_BATCH_SIZE" \
     data.max_prompt_length="$MAX_PROMPT_LENGTH" \
     data.max_response_length="$MAX_RESP_LENGTH" \
     "${CHAT_TEMPLATE_ARGS[@]}" \
@@ -397,7 +438,7 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     actor_rollout_ref.model.path="$ACTOR_MODEL_PATH" \
     actor_rollout_ref.model.use_remove_padding="$ACTOR_USE_REMOVE_PADDING" \
-    actor_rollout_ref.model.enable_activation_offload=True \
+    actor_rollout_ref.model.enable_activation_offload="$ACTOR_ENABLE_ACTIVATION_OFFLOAD" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="$MINI_BATCH_SIZE" \
@@ -414,8 +455,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.model_dtype="$MODEL_DTYPE" \
     actor_rollout_ref.actor.checkpoint.save_contents="[$CHECKPOINT_SAVE_CONTENTS]" \
     actor_rollout_ref.actor.checkpoint.load_contents="[$CHECKPOINT_SAVE_CONTENTS]" \
-    actor_rollout_ref.rollout.max_num_batched_tokens="$PPO_MAX_TOKEN_LEN_PER_GPU" \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.rollout.max_num_batched_tokens="$ROLLOUT_MAX_NUM_BATCHED_TOKENS" \
+    actor_rollout_ref.ref.fsdp_config.param_offload="$REF_PARAM_OFFLOAD" \
     actor_rollout_ref.ref.fsdp_config.model_dtype="$MODEL_DTYPE" \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.name=vllm \
@@ -466,6 +507,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="$CKPT_PATH" \
     trainer.is_plot="$IS_PLOT" \
     ray_kwargs.ray_init.num_cpus="$RAY_NUM_CPUS" \
+    +ray_kwargs.ray_init.include_dashboard="$RAY_INCLUDE_DASHBOARD" \
     +ray_kwargs.ray_init._temp_dir="$RAY_TMP_DIR"
 MAIN_STATUS=$?
 set -e

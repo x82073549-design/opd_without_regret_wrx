@@ -12,9 +12,73 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass
 
 import torch
+
+
+def compute_eopd_fkl_loss(
+    student_log_probs: torch.Tensor,
+    teacher_top_k_log_probs: torch.Tensor,
+    teacher_entropy: torch.Tensor,
+    response_mask: torch.Tensor,
+    entropy_threshold: float = 0.8,
+    fkl_coef: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the entropy-gated top-k forward-KL term from EOPD.
+
+    ``teacher_top_k_log_probs`` are log probabilities under the teacher's full
+    vocabulary distribution. EOPD renormalizes them within the teacher top-k,
+    while ``student_log_probs`` remain probabilities from the student's full
+    vocabulary distribution, matching Equation (10) of arXiv:2603.07079v3.
+    The gated loss is normalized by all valid response tokens so it can be
+    added directly to the baseline token-mean OPD loss.
+    """
+    if student_log_probs.ndim != 3 or teacher_top_k_log_probs.ndim != 3:
+        raise ValueError("EOPD top-k log probabilities must be [batch, response_length, top_k] tensors")
+    if student_log_probs.shape != teacher_top_k_log_probs.shape:
+        raise ValueError("EOPD student and teacher top-k log-probability tensors must have identical shapes")
+    if student_log_probs.shape[-1] <= 0:
+        raise ValueError("EOPD requires a positive top-k size")
+    expected_token_shape = student_log_probs.shape[:-1]
+    if teacher_entropy.ndim != 2 or teacher_entropy.shape != expected_token_shape:
+        raise ValueError("EOPD teacher_entropy must match the [batch, response_length] token shape")
+    if response_mask.ndim != 2 or response_mask.shape != expected_token_shape:
+        raise ValueError("EOPD response_mask must match the [batch, response_length] token shape")
+    if not math.isfinite(entropy_threshold) or entropy_threshold < 0:
+        raise ValueError(f"EOPD entropy_threshold must be finite and non-negative, got {entropy_threshold}")
+    if not math.isfinite(fkl_coef) or fkl_coef < 0:
+        raise ValueError(f"EOPD fkl_coef must be finite and non-negative, got {fkl_coef}")
+
+    # Keep the probability arithmetic in fp32 even when the models run in
+    # bfloat16. Casting the student log probabilities preserves their gradient.
+    student_log_probs_fp32 = student_log_probs.float()
+    teacher_top_k_log_probs_fp32 = teacher_top_k_log_probs.detach().float()
+    teacher_top_k_normalized_log_probs = teacher_top_k_log_probs_fp32 - torch.logsumexp(
+        teacher_top_k_log_probs_fp32, dim=-1, keepdim=True
+    )
+    teacher_top_k_probs = torch.exp(teacher_top_k_normalized_log_probs)
+
+    fkl_per_token = torch.sum(
+        teacher_top_k_probs * (teacher_top_k_normalized_log_probs - student_log_probs_fp32), dim=-1
+    )
+    valid_mask = response_mask.to(device=fkl_per_token.device, dtype=torch.bool)
+    high_entropy_mask = (teacher_entropy.detach().to(fkl_per_token.device).float() >= entropy_threshold) & valid_mask
+    valid_mask_fp32 = valid_mask.float()
+    high_entropy_mask_fp32 = high_entropy_mask.float()
+    valid_token_count = valid_mask_fp32.sum().clamp_min(1.0)
+    high_entropy_token_count = high_entropy_mask_fp32.sum().clamp_min(1.0)
+
+    fkl_loss = fkl_coef * (fkl_per_token * high_entropy_mask_fp32).sum() / valid_token_count
+    teacher_top_k_mass = torch.exp(teacher_top_k_log_probs_fp32).sum(dim=-1)
+    metrics = {
+        "high_entropy_ratio": high_entropy_mask_fp32.sum() / valid_token_count,
+        "high_entropy_fkl": (fkl_per_token.detach() * high_entropy_mask_fp32).sum()
+        / high_entropy_token_count,
+        "teacher_topk_mass": (teacher_top_k_mass.detach() * valid_mask_fp32).sum() / valid_token_count,
+    }
+    return fkl_loss, metrics
 
 
 def apply_g_opd_reward(

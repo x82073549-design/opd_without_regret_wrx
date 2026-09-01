@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import multiprocessing  # Added for spawn-based worker management
 import gc  # Added for explicit resource cleanup
+from collections import Counter
 import torch  # Added for CUDA cache cleanup
 from pathlib import Path
 from typing import Optional
@@ -58,11 +59,11 @@ TASKS = [
     {"name": "AMC23", "path": f"{DATA_DIR}/AMC23/test.parquet", "N": 16},
 ]
 
-PROMPT_TEMPLATE = """{problem} Please reason step by step, and put your final answer within \\boxed{{}}."""
+ANSWER_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
+PROMPT_TEMPLATE = """{problem} {instruction}"""
 MAX_TOKENS  = 31744
 TEMPERATURE = 0.7
 TOP_P       = 0.95
-REPLACE     = False
 
 # --------------------------------------------------------------------------- #
 #                               Helper functions                              #
@@ -106,28 +107,55 @@ def make_request_seed(example_id: int, evaluation_seed: int) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big") & 0x7FFFFFFF
 
 
+def ensure_answer_instruction(prompt: str) -> str:
+    """Append the answer-format instruction exactly once."""
+    prompt = prompt.strip()
+    if ANSWER_INSTRUCTION in prompt:
+        return prompt
+    return PROMPT_TEMPLATE.format(problem=prompt, instruction=ANSWER_INSTRUCTION)
+
+
 # --------------------------------------------------------------------------- #
 #              Worker process (one model instance per GPU worker)              #
 # --------------------------------------------------------------------------- #
 def worker_process(args_tuple):
     """
     Each worker runs on a single GPU:
-    args_tuple = (model_name, samples, evaluation_seed_list, gpu_id, enable_thinking)
+    args_tuple = (
+        model_name,
+        samples,
+        evaluation_seed_list,
+        gpu_id,
+        enable_thinking,
+        max_tokens,
+        temperature,
+        top_p,
+    )
     gpu_id: values such as "0" or "3", used for CUDA_VISIBLE_DEVICES
     """
-    model_name, samples, evaluation_seed_list, gpu_id, enable_thinking = args_tuple
+    (
+        model_name,
+        samples,
+        evaluation_seed_list,
+        gpu_id,
+        enable_thinking,
+        max_tokens,
+        temperature,
+        top_p,
+    ) = args_tuple
     
     # CUDA_VISIBLE_DEVICES must be set inside the spawned process.
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
     
     results = []
     llm = None
-    stop_token_ids = []
-    
+
     try:
+        thinking_description = "model-default" if enable_thinking is None else str(enable_thinking)
         print(
             f"[GPU {gpu_id}] | Model: {model_name} | seeds len={len(evaluation_seed_list)} "
-            f"| loading model (TP=1, enable_thinking={enable_thinking})...",
+            f"| loading model (TP=1, enable_thinking={thinking_description}, "
+            f"max_tokens={max_tokens})...",
             flush=True,
         )
         
@@ -139,42 +167,42 @@ def worker_process(args_tuple):
             tensor_parallel_size=1,
         )
         
-        # Get the tokenizer.
+        # Get the tokenizer. vLLM already stops on the tokenizer/model EOS token.
+        # Do not derive stop token IDs from hard-coded strings: a string that is
+        # not special for this tokenizer may encode to several ordinary tokens.
         try:
             tokenizer = llm.get_tokenizer()
-            
-            # Encode stop tokens.
-            for stop_token in ["<|im_end|>", "<|endoftext|>"]:
-                try:
-                    if hasattr(tokenizer, "encode"):
-                        encoded = tokenizer.encode(stop_token, add_special_tokens=False)
-                        if encoded:
-                            stop_token_ids.append(encoded[0])
-                except Exception:
-                    pass
+            print(
+                f"[GPU {gpu_id}] tokenizer EOS: token={tokenizer.eos_token!r}, "
+                f"id={tokenizer.eos_token_id}; custom stop_token_ids disabled",
+                flush=True,
+            )
         except Exception as e:
             tokenizer = None
-            print(f"[GPU {gpu_id}] Warning: Could not get tokenizer for stop tokens: {e}", flush=True)
+            print(f"[GPU {gpu_id}] Warning: Could not get tokenizer: {e}", flush=True)
         
         for evaluation_seed in evaluation_seed_list:
             if tokenizer is None:
                 raise RuntimeError("Tokenizer is required for apply_chat_template, but it could not be loaded.")
 
+            chat_template_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            if enable_thinking is not None:
+                chat_template_kwargs["enable_thinking"] = enable_thinking
             formatted_prompts = [
                 tokenizer.apply_chat_template(
                     [{"role": "user", "content": s["prompt"]}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
+                    **chat_template_kwargs,
                 )
                 for s in samples
             ]
             sampling_params = [
                 SamplingParams(
-                    temperature=TEMPERATURE,
-                    top_p=TOP_P,
-                    max_tokens=MAX_TOKENS,
-                    stop_token_ids=stop_token_ids if stop_token_ids else None,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
                     seed=make_request_seed(sample["example_id"], evaluation_seed),
                 )
                 for sample in samples
@@ -184,6 +212,10 @@ def worker_process(args_tuple):
             outputs = llm.generate(formatted_prompts, sampling_params, use_tqdm=False)
             
             for sample, out in zip(samples, outputs):
+                completion = out.outputs[0]
+                stop_reason = completion.stop_reason
+                if stop_reason is not None and not isinstance(stop_reason, (str, int, float, bool)):
+                    stop_reason = str(stop_reason)
                 results.append(
                     {
                         "example_id": sample["example_id"],
@@ -193,7 +225,11 @@ def worker_process(args_tuple):
                         "request_seed": make_request_seed(sample["example_id"], evaluation_seed),
                         # Retain the legacy key for downstream readers.
                         "seed": evaluation_seed,
-                        "response": out.outputs[0].text,
+                        "response": completion.text,
+                        "finish_reason": completion.finish_reason,
+                        "stop_reason": stop_reason,
+                        "response_token_count": len(completion.token_ids or []),
+                        "prompt_token_count": len(out.prompt_token_ids or []),
                     }
                 )
     
@@ -302,8 +338,6 @@ def sha256_file(path: str) -> str:
 
 
 def main():
-    global MAX_TOKENS, TEMPERATURE, TOP_P, REPLACE
-
     parser = argparse.ArgumentParser(description="Generate evaluation rollouts with vLLM.")
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
@@ -333,8 +367,10 @@ def main():
     parser.add_argument("--temperature", type=float, default=TEMPERATURE)
     parser.add_argument("--top-p", type=float, default=TOP_P)
     parser.add_argument("--replace", action="store_true", help="Overwrite existing generation files.")
-    parser.set_defaults(enable_thinking=False)
+    parser.set_defaults(enable_thinking=None)
     args = parser.parse_args()
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be positive.")
 
     model_names = args.models or MODEL_NAMES
     if args.task_manifest and args.tasks:
@@ -348,14 +384,11 @@ def main():
     if not gpu_workers:
         raise ValueError("--gpus must contain at least one GPU id.")
 
-    MAX_TOKENS = args.max_tokens
-    TEMPERATURE = args.temperature
-    TOP_P = args.top_p
-    REPLACE = args.replace
     num_workers = len(gpu_workers)
 
     print(f"GPU workers (one model per GPU): {gpu_workers}")
-    print(f"apply_chat_template enable_thinking={args.enable_thinking}")
+    thinking_description = "model-default" if args.enable_thinking is None else str(args.enable_thinking)
+    print(f"apply_chat_template enable_thinking={thinking_description}")
 
     for model_name in model_names:
         print(f"\n{'='*50}\nStarting evaluation for model: {model_name}\n{'='*50}")
@@ -378,12 +411,13 @@ def main():
             seed_spec = ",".join(str(seed) for seed in task_seeds)
             seed_hash = hashlib.sha256(seed_spec.encode("utf-8")).hexdigest()[:10]
             out_path = OUT_DIR / (
-                f"{task_name.lower()}_t{TEMPERATURE}_p{TOP_P}_n{N}-MNT{MAX_TOKENS}-ES{seed_hash}.jsonl"
+                f"{task_name.lower()}_t{args.temperature}_p{args.top_p}_n{N}"
+                f"-MNT{args.max_tokens}-ES{seed_hash}.jsonl"
             )
             manifest_path = out_path.with_suffix(".manifest.json")
 
             # --- Repetition Check ---
-            if not REPLACE and out_path.exists():
+            if not args.replace and out_path.exists():
                 if not manifest_path.exists():
                     raise RuntimeError(
                         f"Result file exists without a generation manifest: {out_path}. "
@@ -397,10 +431,11 @@ def main():
                     "task_path": str(Path(task_path).resolve()),
                     "task_sha256": sha256_file(task_path),
                     "evaluation_seeds": task_seeds,
-                    "temperature": TEMPERATURE,
-                    "top_p": TOP_P,
-                    "max_tokens": MAX_TOKENS,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "max_tokens": args.max_tokens,
                     "enable_thinking": args.enable_thinking,
+                    "stop_policy": "model_eos",
                 }
                 mismatches = {
                     key: {"expected": value, "actual": existing_manifest.get(key)}
@@ -450,10 +485,10 @@ def main():
                     f"expected {expected_num_questions}, got {len(samples)}."
                 )
 
-            # Append suffix prompt to each sample
+            # Append the suffix only when the dataset prompt does not already
+            # contain it. The standard OPD parquet prompts are preformatted.
             for sample in samples:
-                # Ensure the prompt format is correct.
-                sample["prompt"] = PROMPT_TEMPLATE.format(problem=sample["prompt"])
+                sample["prompt"] = ensure_answer_instruction(sample["prompt"])
 
             if len(samples) > 0:
                 print("Example prompt after formatting:")
@@ -465,7 +500,16 @@ def main():
             # 3. Launch workers, with each worker using one GPU.
             all_results = []
             args_list = [
-                (model_name, samples, seed_chunks[i], gpu_workers[i], args.enable_thinking)
+                (
+                    model_name,
+                    samples,
+                    seed_chunks[i],
+                    gpu_workers[i],
+                    args.enable_thinking,
+                    args.max_tokens,
+                    args.temperature,
+                    args.top_p,
+                )
                 for i in range(num_workers)
                 if seed_chunks[i]
             ]
@@ -501,6 +545,10 @@ def main():
                 )
 
             all_results.sort(key=lambda item: (item["example_id"], item["evaluation_seed"]))
+            finish_reason_counts = Counter(str(item["finish_reason"]) for item in all_results)
+            stop_reason_counts = Counter(str(item["stop_reason"]) for item in all_results)
+            print(f"Finish reasons for {task_name}: {dict(finish_reason_counts)}")
+            print(f"Stop reasons for {task_name}: {dict(stop_reason_counts)}")
 
             # 4. Save to disk
             if all_results:
@@ -517,10 +565,19 @@ def main():
                     "request_seed_scheme": "sha256(example_id:evaluation_seed) first 31 bits",
                     "expected_generations": expected_count,
                     "actual_generations": len(all_results),
-                    "temperature": TEMPERATURE,
-                    "top_p": TOP_P,
-                    "max_tokens": MAX_TOKENS,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "max_tokens": args.max_tokens,
                     "enable_thinking": args.enable_thinking,
+                    "stop_policy": "model_eos",
+                    "finish_reason_counts": dict(finish_reason_counts),
+                    "stop_reason_counts": dict(stop_reason_counts),
+                    "generation_metadata_fields": [
+                        "finish_reason",
+                        "stop_reason",
+                        "response_token_count",
+                        "prompt_token_count",
+                    ],
                     "output_file": str(out_path.resolve()),
                 }
                 with manifest_path.open("w", encoding="utf-8") as f:

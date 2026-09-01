@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.opd_variants import compute_eopd_fkl_loss
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -1234,6 +1235,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        eopd_cfg = data.meta_info.get("eopd", None)
+        eopd_enabled = bool(eopd_cfg.get("enable", False)) if eopd_cfg is not None else False
 
         select_keys = [
             "responses",
@@ -1263,6 +1266,13 @@ class DataParallelPPOActor(BasePPOActor):
         # Include student_top_k_ids if present (for fixing "apples-to-oranges" bug)
         if "student_top_k_ids" in data.batch.keys():
             select_keys.append("student_top_k_ids")
+
+        if eopd_enabled:
+            required_eopd_keys = ("teacher_top_k_ids", "teacher_top_k_log_probs", "teacher_entropy")
+            missing_eopd_keys = [key for key in required_eopd_keys if key not in data.batch.keys()]
+            if missing_eopd_keys:
+                raise ValueError(f"EOPD actor update is missing required teacher tensors: {missing_eopd_keys}")
+            select_keys.extend(required_eopd_keys)
 
         # Include union_top_k_ids/log_probs for union strategy
         if "union_top_k_ids" in data.batch.keys():
@@ -1330,6 +1340,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # Check if we have 3D advantages (top-k sampling case)
                     # If so, we need to recompute top-k log probs for correct gradient
                     sampled_log_prob_for_loss = None
+                    eopd_student_on_teacher_log_probs = None
                     if advantages.dim() == 3:
                         top_k = advantages.shape[-1]
                         # For union strategy, use union_top_k_ids; otherwise use student_top_k_ids
@@ -1339,13 +1350,44 @@ class DataParallelPPOActor(BasePPOActor):
                         elif "student_top_k_ids" in model_inputs:
                             student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                        entropy, sampled_log_prob_for_loss, _, topk_log_probs = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
-                            top_k=top_k, student_top_k_ids=student_top_k_ids
+                        forward_top_k = top_k
+                        forward_target_ids = student_top_k_ids
+                        if eopd_enabled:
+                            if "union_top_k_ids" in model_inputs:
+                                raise ValueError(
+                                    "EOPD must use the baseline only_stu top-k candidates, not union_top_k_ids"
+                                )
+                            if student_top_k_ids is None:
+                                raise ValueError("EOPD requires student_top_k_ids for the baseline RKL branch")
+                            if student_top_k_ids.shape[-1] != top_k:
+                                raise ValueError(
+                                    "EOPD baseline candidate count must match the top-k advantage dimension"
+                                )
+                            teacher_top_k_ids = model_inputs["teacher_top_k_ids"]
+                            if teacher_top_k_ids.shape != student_top_k_ids.shape:
+                                raise ValueError(
+                                    "EOPD teacher_top_k_ids must match the baseline student_top_k_ids shape"
+                                )
+                            # Gather both candidate sets in one student forward. The
+                            # first wing remains the unchanged baseline RKL branch;
+                            # the second wing is used only by the direct FKL term.
+                            forward_target_ids = torch.cat([student_top_k_ids, teacher_top_k_ids], dim=-1)
+                            forward_top_k = forward_target_ids.shape[-1]
+
+                        entropy, sampled_log_prob_for_loss, _, gathered_log_probs = self._forward_micro_batch(
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            top_k=forward_top_k,
+                            student_top_k_ids=forward_target_ids,
                         )
-                        log_prob_for_loss = topk_log_probs
-                        
+                        log_prob_for_loss = gathered_log_probs[..., :top_k]
+                        if eopd_enabled:
+                            eopd_student_on_teacher_log_probs = gathered_log_probs[..., top_k:]
+
                     else:
+                        if eopd_enabled:
+                            raise ValueError("EOPD requires 3D top-k OPD advantages")
                         _, log_prob, *_ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                         )
@@ -1409,6 +1451,37 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask=format_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
+
+                    if eopd_enabled:
+                        entropy_threshold = float(eopd_cfg.get("entropy_threshold", 0.8))
+                        fkl_coef = float(eopd_cfg.get("fkl_coef", 1.0))
+                        eopd_fkl_loss, eopd_metrics = compute_eopd_fkl_loss(
+                            student_log_probs=eopd_student_on_teacher_log_probs,
+                            teacher_top_k_log_probs=model_inputs["teacher_top_k_log_probs"],
+                            teacher_entropy=model_inputs["teacher_entropy"],
+                            response_mask=response_mask,
+                            entropy_threshold=entropy_threshold,
+                            fkl_coef=fkl_coef,
+                        )
+                        micro_batch_metrics["actor/eopd_rkl_pg_loss"] = (
+                            pg_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/eopd_fkl_loss"] = (
+                            eopd_fkl_loss.detach().item() * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/eopd_high_entropy_ratio"] = (
+                            eopd_metrics["high_entropy_ratio"].detach().item()
+                        )
+                        micro_batch_metrics["actor/eopd_high_entropy_fkl"] = (
+                            eopd_metrics["high_entropy_fkl"].detach().item()
+                        )
+                        micro_batch_metrics["actor/eopd_teacher_topk_mass"] = (
+                            eopd_metrics["teacher_topk_mass"].detach().item()
+                        )
+                        pg_loss = pg_loss + eopd_fkl_loss
+                        micro_batch_metrics["actor/eopd_total_pg_loss"] = (
+                            pg_loss.detach().item() * loss_scale_factor
+                        )
 
                     if grpo_advantages is not None:
                         grpo_pg_loss, grpo_pg_metrics = policy_loss_fn(

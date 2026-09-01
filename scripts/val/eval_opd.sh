@@ -59,7 +59,7 @@ fi
 MAX_TOKENS=${MAX_TOKENS:-31744}
 TEMPERATURE=${TEMPERATURE:-0.7}
 TOP_P=${TOP_P:-0.95}
-THINKING_FLAG=${THINKING_FLAG:---disable-thinking}
+THINKING_FLAG=${THINKING_FLAG:-}
 REPLACE_FLAG=${REPLACE_FLAG:-}
 VALIDATION_MANIFEST=${VALIDATION_MANIFEST:-}
 CODE_COMMIT=${CODE_COMMIT:-}
@@ -102,6 +102,28 @@ else
     echo "Merged HF model already exists at ${MERGED_DIR}; skipping merge."
 fi
 
+THINKING_ARGS=()
+if [ -n "$THINKING_FLAG" ]; then
+    case "$THINKING_FLAG" in
+        --enable-thinking|--disable-thinking)
+            THINKING_ARGS=("$THINKING_FLAG")
+            ;;
+        *)
+            echo "THINKING_FLAG must be empty, --enable-thinking, or --disable-thinking: $THINKING_FLAG" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+REPLACE_ARGS=()
+if [ -n "$REPLACE_FLAG" ]; then
+    if [ "$REPLACE_FLAG" != "--replace" ]; then
+        echo "REPLACE_FLAG must be empty or --replace: $REPLACE_FLAG" >&2
+        exit 1
+    fi
+    REPLACE_ARGS=("$REPLACE_FLAG")
+fi
+
 python3 scripts/val/eval/gen_vllm.py \
     --model "$MERGED_DIR" \
     --out-dir "$OUT_ROOT" \
@@ -112,8 +134,8 @@ python3 scripts/val/eval/gen_vllm.py \
     --temperature "$TEMPERATURE" \
     --top-p "$TOP_P" \
     "${TASK_ARGS[@]}" \
-    $THINKING_FLAG \
-    $REPLACE_FLAG
+    "${THINKING_ARGS[@]}" \
+    "${REPLACE_ARGS[@]}"
 
 EVAL_DIR="${OUT_ROOT}/$(basename "$MERGED_DIR")"
 python3 scripts/val/eval/grade.py \

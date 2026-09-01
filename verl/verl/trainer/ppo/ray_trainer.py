@@ -1411,6 +1411,14 @@ class RayPPOTrainer:
                         grpo_gated_opd_enabled = False
                         g_opd_enabled = False
                         g_opd = None
+                        eopd_cfg = self.config.algorithm.get("eopd", None)
+                        eopd = None
+                        eopd_enabled = False
+                        if eopd_cfg is not None:
+                            eopd = OmegaConf.to_container(eopd_cfg, resolve=True)
+                            eopd_enabled = bool(eopd.get("enable", False))
+                        if eopd_enabled and not self.use_rm:
+                            raise ValueError("EOPD requires an enabled teacher/reward model")
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             with marked_timer("compute_log_prob", timing_raw, color="blue"):
@@ -1439,6 +1447,22 @@ class RayPPOTrainer:
                                     raise ValueError("G-OPD reward_scale must be positive")
                                 if self.ref_in_actor:
                                     raise ValueError("G-OPD does not support LoRA actor-as-reference")
+                            if eopd_enabled:
+                                if top_k <= 0 or strategy != "only_stu":
+                                    raise ValueError("EOPD requires log_prob_top_k > 0 and top_k_strategy=only_stu")
+                                eopd_top_k = int(eopd.get("top_k", top_k))
+                                if eopd_top_k != top_k:
+                                    raise ValueError("EOPD top_k must match actor_rollout_ref.rollout.log_prob_top_k")
+                                entropy_threshold = float(eopd.get("entropy_threshold", 0.8))
+                                fkl_coef = float(eopd.get("fkl_coef", 1.0))
+                                if not np.isfinite(entropy_threshold) or entropy_threshold < 0:
+                                    raise ValueError("EOPD entropy_threshold must be finite and non-negative")
+                                if not np.isfinite(fkl_coef) or fkl_coef < 0:
+                                    raise ValueError("EOPD fkl_coef must be finite and non-negative")
+                                if self.config.algorithm.adv_estimator != "token_reward_direct":
+                                    raise ValueError(
+                                        "EOPD comparison runs require algorithm.adv_estimator=token_reward_direct"
+                                    )
                             prefix_correction_cfg = self.config.algorithm.get("prefix_correction", None)
                             prefix_correction = None
                             prefix_correction_enabled = False
@@ -1633,6 +1657,31 @@ class RayPPOTrainer:
                                 topk_gate_for_reward.setdefault("opd_coef", 1.0)
                                 topk_gate_for_reward.setdefault("metric_prefix", "topk_gate")
 
+                            if eopd_enabled:
+                                outcome_opd_mask_cfg = self.config.algorithm.get("outcome_opd_mask", None)
+                                outcome_opd_mask_enabled = bool(
+                                    outcome_opd_mask_cfg is not None and outcome_opd_mask_cfg.get("enable", False)
+                                )
+                                conflicting_variants = {
+                                    "g_opd": g_opd_enabled,
+                                    "prefix_correction": prefix_correction_enabled,
+                                    "ratio_kl_switch": ratio_kl_switch_enabled,
+                                    "overlap_route_opd": overlap_route_enabled,
+                                    "oracle_ra_opd": oracle_ra_opd_enabled,
+                                    "grpo_gated_opd": grpo_gated_opd_enabled,
+                                    "sampled_token_gate_opd": sampled_token_gate_opd_enabled,
+                                    "topk_token_gate_opd": topk_token_gate_opd_enabled,
+                                    "outcome_opd_mask": outcome_opd_mask_enabled,
+                                }
+                                enabled_conflicts = [
+                                    name for name, enabled in conflicting_variants.items() if enabled
+                                ]
+                                if enabled_conflicts:
+                                    raise ValueError(
+                                        "EOPD cannot be combined with other OPD variants: "
+                                        + ", ".join(enabled_conflicts)
+                                    )
+
                             if prefix_correction_enabled and top_k > 0 and strategy == "only_stu":
                                 sampled_ids = batch.batch["responses"].unsqueeze(-1)
                                 student_top_k_ids = batch.batch["student_top_k_ids"]
@@ -1667,6 +1716,8 @@ class RayPPOTrainer:
                             batch.meta_info["kl_estimator"] = kl_estimator
                             batch.meta_info["reward_weight_mode"] = reward_weight_mode
                             batch.meta_info["teacher_temperature"] = teacher_temperature
+                            if eopd_enabled:
+                                batch.meta_info["eopd"] = eopd
                             if prefix_correction_enabled:
                                 batch.meta_info["prefix_correction"] = prefix_correction
                             if ratio_kl_switch_enabled:
@@ -3385,6 +3436,9 @@ class RayPPOTrainer:
                         "sampled_gate_ungated_topk_opd_abs_mean_token",
                         "sampled_gate_gated_topk_opd_abs_mean_token",
                     ]
+                    if eopd_enabled:
+                        eopd_actor_keys = {"teacher_top_k_ids", "teacher_top_k_log_probs", "teacher_entropy"}
+                        keys_to_pop = [key for key in keys_to_pop if key not in eopd_actor_keys]
                     for key in keys_to_pop:
                         if key in batch.batch.keys():
                             batch.batch.pop(key)
@@ -3404,6 +3458,10 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        if eopd_enabled:
+                            for key in ("teacher_top_k_ids", "teacher_top_k_log_probs", "teacher_entropy"):
+                                if key in batch.batch.keys():
+                                    batch.batch.pop(key)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
-# Prune-OPD reproduction for 2605.07804v3. All non-method parameters inherit opd_4b.sh.
+# Prune-OPD reproduction for 2605.07804v3. All non-method parameters inherit
+# opd_4b_qwen3_teacher_student.sh.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 export METHOD=${METHOD:-prune_opd}
+export EOPD_ENABLE=False
 export G_OPD_ENABLE=False
 export PRUNE_OPD_ENABLE=${PRUNE_OPD_ENABLE:-True}
 export PRUNE_OPD_OVERLAP_THRESHOLD=${PRUNE_OPD_OVERLAP_THRESHOLD:-0.7}
@@ -21,8 +23,8 @@ export PRUNE_OPD_DYNAMIC_HIT_RATIO=${PRUNE_OPD_DYNAMIC_HIT_RATIO:-0.1}
 export PRUNE_OPD_DYNAMIC_SHRINK_PATIENCE=${PRUNE_OPD_DYNAMIC_SHRINK_PATIENCE:-3}
 export PRUNE_OPD_DYNAMIC_EPSILON=${PRUNE_OPD_DYNAMIC_EPSILON:-1e-8}
 
-# Match the official DeepSeek/JustRL launcher: do not pass enable_thinking.
-export ENABLE_THINKING=
+# The Qwen3-4B student must use the explicit non-thinking chat template.
+export ENABLE_THINKING=False
 
 # Validation sampling configuration.
 export MAX_VAL_RESP_LENGTH=${MAX_VAL_RESP_LENGTH:-31744}
@@ -30,4 +32,4 @@ export VAL_TEMPERATURE=${VAL_TEMPERATURE:-0.7}
 export VAL_TOP_P=${VAL_TOP_P:-0.95}
 export VAL_N=${VAL_N:-16}
 
-exec bash "$SCRIPT_DIR/opd_4b.sh" "$@"
+exec bash "$SCRIPT_DIR/opd_4b_qwen3_teacher_student.sh" "$@"
